@@ -1,67 +1,86 @@
 # data_manager.py
 #
 # Description:
-# A reusable data manager that loads and caches OHLCV data from MongoDB.
-# This component is designed to be imported by other parts of the trading system,
-# such as the optimizer or a live trading engine.
+# Handles loading and caching of historical market data from MongoDB.
+# It is designed to load all necessary data into memory once to provide
+# fast access for backtesting and optimization.
 #
 # Author: Gemini
-# Date: 2025-07-29
+# Date: 2025-09-13 (v3 - Corrected config parameter name)
 
 import pandas as pd
-from pymongo import MongoClient
+from pymongo import MongoClient, DESCENDING
+from pymongo.errors import ConnectionFailure
 import config
 
 class DataManager:
     """
-    Handles loading and providing all OHLCV data needed for various trading components.
-    Data is cached in memory to avoid repeated database calls.
+    Manages loading and caching of historical OHLCV data from MongoDB.
     """
     def __init__(self, symbols, timeframes):
         """
-        Initializes the DataManager and pre-loads all specified data.
-        :param symbols: A list or set of symbols to load (e.g., ['BTC/USDT']).
-        :param timeframes: A list or set of timeframes to load (e.g., ['1d', '1h']).
+        Initializes the DataManager, connects to MongoDB, and loads all
+        required data into an in-memory cache.
         """
-        print("Initializing Data Manager...")
-        self.client = MongoClient(config.MONGO_URI)
-        self.db = self.client[config.MONGO_DB_NAME]
-        self._data_cache = {}
-        self._load_all_data(symbols, timeframes)
+        self.client = None
+        self.db = None
+        self.data_cache = {}
+        try:
+            self.client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=5000)
+            self.client.server_info() # Trigger exception if cannot connect
+            # --- FIX: Changed DATABASE_NAME back to MONGO_DB_NAME ---
+            self.db = self.client[config.MONGO_DB_NAME]
+            print("Successfully connected to MongoDB.")
+            self._load_all_data(symbols, timeframes)
+        except ConnectionFailure:
+            print(f"Error: Could not connect to MongoDB at {config.MONGO_URI}.")
+            print("Please ensure MongoDB is running and accessible.")
+            exit(1)
+        except AttributeError:
+             print(f"Error: Could not find 'MONGO_DB_NAME' in your config.py file.")
+             print("Please ensure the database name variable is correctly set.")
+             exit(1)
+        except Exception as e:
+            print(f"An unexpected error occurred during DataManager initialization: {e}")
+            exit(1)
 
     def _load_all_data(self, symbols, timeframes):
-        """Pre-loads all symbol/timeframe combinations into a cache."""
-        print("--- Pre-loading all data into memory ---")
+        """
+        Loads all specified symbol/timeframe combinations from the database
+        into the self.data_cache dictionary.
+        """
+        print(f"Loading data for {len(symbols) * len(timeframes)} collection(s)...")
         for symbol in symbols:
             for timeframe in timeframes:
-                cache_key = f"{symbol}_{timeframe}"
-                print(f"Loading data for {cache_key}...")
                 collection_name = f"{symbol.replace('/', '_')}_{timeframe}"
+                collection = self.db[collection_name]
                 
-                if collection_name not in self.db.list_collection_names():
-                    print(f"Warning: Collection '{collection_name}' not found.")
-                    continue
-
-                # Load all data from the collection and sort by timestamp
-                data = list(self.db[collection_name].find({}, {'_id': 0}).sort('timestamp', 1))
-                if not data:
-                    print(f"Warning: No data in collection '{collection_name}'.")
-                    continue
-                
-                df = pd.DataFrame(data)
-                df.set_index('timestamp', inplace=True)
-                self._data_cache[cache_key] = df[['open', 'high', 'low', 'close', 'volume']]
-                print(f"Loaded {len(df)} records for {cache_key}.")
-        print("--- Data loading complete ---\n")
+                if collection.count_documents({}) > 0:
+                    print(f"  Loading {collection_name}...")
+                    cursor = collection.find({}).sort('timestamp', DESCENDING)
+                    df = pd.DataFrame(list(cursor))
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df.set_index('timestamp', inplace=True)
+                    df.sort_index(inplace=True)
+                    self.data_cache[f"{symbol}_{timeframe}"] = df
+                else:
+                    print(f"  Warning: Collection '{collection_name}' not found or is empty.")
+        print("Data loading complete.")
 
     def get_data(self, symbol, timeframe):
         """
-        Returns a copy of the cached DataFrame to prevent accidental modification.
-        :param symbol: The symbol to retrieve (e.g., 'BTC/USDT').
-        :param timeframe: The timeframe to retrieve (e.g., '1h').
-        :return: A pandas DataFrame with the requested OHLCV data.
+        Retrieves a dataframe from the cache for a given symbol and timeframe.
+        Always returns a COPY of the dataframe to ensure data isolation.
         """
-        cache_key = f"{symbol}_{timeframe}"
-        if cache_key not in self._data_cache:
-            raise ValueError(f"Data for {cache_key} not loaded. Check your configuration.")
-        return self._data_cache[cache_key].copy()
+        key = f"{symbol}_{timeframe}"
+        df = self.data_cache.get(key)
+        if df is not None:
+            return df.copy() # Return a copy, not a reference
+        return None
+
+    def close(self):
+        """Closes the MongoDB connection."""
+        if self.client:
+            self.client.close()
+            print("MongoDB connection closed.")
+

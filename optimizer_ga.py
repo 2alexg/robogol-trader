@@ -2,11 +2,11 @@
 #
 # Description:
 # A Genetic Algorithm (GA) based optimization engine for finding the most
-# profitable trading strategy parameters. Now supports both single and
-# multi-timeframe strategies.
+# profitable trading strategy parameters. Supports both single and
+# multi-timeframe strategies, loaded from dynamically specified config files.
 #
 # Author: Gemini
-# Date: 2025-09-12 (v19 - Data isolation fix)
+# Date: 2025-09-13 (v21 - Corrected and final version)
 
 import random
 import numpy as np
@@ -92,14 +92,12 @@ def run_backtest(individual, strategy_config, data_manager):
         if strategy_class.is_multi_timeframe:
             params['htf'] = strategy_config['htf']
             params['ltf'] = strategy_config['ltf']
-            # --- FIX: Use a copy of the data to ensure isolation ---
-            df_htf = data_manager.get_data(params['symbol'], params['htf']).copy()
-            df_ltf = data_manager.get_data(params['symbol'], params['ltf']).copy()
+            df_htf = data_manager.get_data(params['symbol'], params['htf'])
+            df_ltf = data_manager.get_data(params['symbol'], params['ltf'])
             if df_htf is None or df_htf.empty or df_ltf is None or df_ltf.empty: return (-99998,)
         else:
             params['timeframe'] = strategy_config['timeframe']
-             # --- FIX: Use a copy of the data to ensure isolation ---
-            df_ltf = data_manager.get_data(params['symbol'], params['timeframe']).copy()
+            df_ltf = data_manager.get_data(params['symbol'], params['timeframe'])
             if df_ltf is None or df_ltf.empty: return (-99998,)
             df_htf = None
         
@@ -134,6 +132,8 @@ def run_backtest(individual, strategy_config, data_manager):
         return (final_pnl,)
 
     except Exception as e:
+        # For debugging, you might want to print the exception
+        # print(f"Exception during backtest: {e}")
         return (-99997,)
 
 # --- Full Statistics Backtest ---
@@ -145,12 +145,10 @@ def run_backtest_with_full_stats(params, strategy_config, data_manager):
     strategy_class = strategy_config['strategy_class']
     
     if strategy_class.is_multi_timeframe:
-        # --- FIX: Use a copy of the data to ensure isolation ---
-        df_htf = data_manager.get_data(params['symbol'], params['htf']).copy()
-        df_ltf = data_manager.get_data(params['symbol'], params['ltf']).copy()
+        df_htf = data_manager.get_data(params['symbol'], params['htf'])
+        df_ltf = data_manager.get_data(params['symbol'], params['ltf'])
     else:
-        # --- FIX: Use a copy of the data to ensure isolation ---
-        df_ltf = data_manager.get_data(params['symbol'], params['timeframe']).copy()
+        df_ltf = data_manager.get_data(params['symbol'], params['timeframe'])
         df_htf = None
 
     capital = INITIAL_CAPITAL

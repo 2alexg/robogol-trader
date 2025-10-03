@@ -12,6 +12,7 @@ from .base_strategy import BaseStrategy
 class RsiBollingerStrategy(BaseStrategy):
     """
     RSI + Bollinger Bands Mean Reversion Strategy.
+    https://www.youtube.com/watch?v=SOS_YnPZSQo
     """
     is_multi_timeframe = False
 

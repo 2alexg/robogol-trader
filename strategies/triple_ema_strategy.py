@@ -16,6 +16,7 @@ class TripleEMAStrategy(BaseStrategy):
     - A long-term EMA (e.g., 200) determines the trend.
     - A medium-term EMA (e.g., 21) acts as a dynamic support/resistance level.
     - A short-term EMA (e.g., 9) is used for the entry signal crossover.
+    https://www.youtube.com/watch?v=gpNCa-KbOfg
     """
     is_multi_timeframe = False
 

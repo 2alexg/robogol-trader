@@ -15,6 +15,7 @@ from .base_strategy import BaseStrategy
 class StochRsiEmaStrategy(BaseStrategy):
     """
     Implements the Stochastic RSI + EMA multi-timeframe strategy.
+    https://www.youtube.com/watch?v=UH9lp6_t86Y
     """
     is_multi_timeframe = True
 

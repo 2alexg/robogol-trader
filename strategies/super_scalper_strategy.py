@@ -11,6 +11,7 @@ class SuperScalperStrategy(BaseStrategy):
     A scalping strategy based on the YouTube video by 'Trade Pro'.
     It uses a 200 EMA to determine the trend and Donchian Channels to
     identify entries on pullbacks to dynamic support/resistance.
+    https://www.youtube.com/watch?v=TuNK4So36pw
     """
     is_multi_timeframe = False
 

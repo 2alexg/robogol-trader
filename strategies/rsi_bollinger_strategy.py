@@ -1,71 +1,76 @@
-# strategies/rsi_bollinger_strategy.py
+# rsi_bollinger_strategy.py
 #
 # Description:
-# A mean-reversion strategy based on the YouTube video by Trade Pro:
+# A mean-reversion strategy using Bollinger Bands and RSI. The strategy is
+# based on the YouTube video by Trade Pro:
 # https://www.youtube.com/watch?v=SOS_YnPZSQo
-# It uses Bollinger Bands to identify price extremes and RSI to confirm
-# overbought/oversold conditions.
 
-import pandas_ta as ta
+# This version uses a robust dynamic discovery method for indicator column
+# names to ensure compatibility with future library updates.
+#
+# Author: Gemini
+# Date: 2025-10-04
+
 from .base_strategy import BaseStrategy
+import pandas_ta as ta
 
 class RsiBollingerStrategy(BaseStrategy):
     """
-    RSI + Bollinger Bands Mean Reversion Strategy.
-    https://www.youtube.com/watch?v=SOS_YnPZSQo
+    A mean-reversion strategy that enters trades when the price moves outside
+    the Bollinger Bands and the RSI indicates an overbought/oversold condition.
     """
-    is_multi_timeframe = False
-
     def __init__(self, params):
         super().__init__(params)
-        self.bband_period = params.get('bband_period', 20)
-        self.bband_std = params.get('bband_std', 2.0)
-        self.rsi_period = params.get('rsi_period', 14)
-        self.rsi_oversold = params.get('rsi_oversold', 30)
-        self.rsi_overbought = params.get('rsi_overbought', 70)
+        self.rsi_period = int(params.get('rsi_period', 14))
+        self.rsi_oversold = int(params.get('rsi_oversold', 30))
+        self.rsi_overbought = int(params.get('rsi_overbought', 70))
+        self.bb_length = int(params.get('bb_length', 20))
+        self.bb_std = float(params.get('bb_std', 2.0))
+        
+        # --- FIX: Initialize column names to None. They will be discovered dynamically. ---
+        self.rsi_col = None
+        self.bbl_col = None
+        self.bbm_col = None
+        self.bbu_col = None
 
-        # Define the column names for the indicators
-        self.bbl_col = f'BBL_{self.bband_period}_{self.bband_std}' # Lower Band
-        self.bbu_col = f'BBU_{self.bband_period}_{self.bband_std}' # Upper Band
-        self.rsi_col = f'RSI_{self.rsi_period}'
-
-    def calculate_indicators(self, df_htf, df_ltf):
-        """
-        Calculates Bollinger Bands and RSI.
-        """
-        # Calculate Bollinger Bands
-        df_ltf.ta.bbands(
-            length=self.bband_period,
-            std=self.bband_std,
-            append=True
-        )
+    def calculate_indicators(self, high_tf_data, low_tf_data):
+        df = low_tf_data.copy()
+        
         # Calculate RSI
-        df_ltf.ta.rsi(
-            length=self.rsi_period,
-            append=True
-        )
-        return None, df_ltf
+        df.ta.rsi(length=self.rsi_period, append=True)
+        
+        # Calculate Bollinger Bands
+        df.ta.bbands(length=self.bb_length, std=self.bb_std, append=True)
+
+        # --- FIX: Dynamically find the column names after they are created ---
+        # This is robust and not dependent on the library's naming convention.
+        for col in df.columns:
+            if col.startswith('RSI_'): self.rsi_col = col
+            if col.startswith('BBL_'): self.bbl_col = col
+            if col.startswith('BBM_'): self.bbm_col = col
+            if col.startswith('BBU_'): self.bbu_col = col
+
+        # Add a sanity check to ensure all columns were found
+        if not all([self.rsi_col, self.bbl_col, self.bbm_col, self.bbu_col]):
+            raise ValueError("Could not dynamically find all required indicator columns in the DataFrame.")
+
+        return high_tf_data, df
 
     def get_entry_signal(self, prev_row, current_row):
         """
-        Determines the entry signal based on the strategy rules.
+        Determines the entry signal based on Bollinger Bands and RSI.
         """
-        # Long Entry Conditions:
-        # 1. Previous close was below the lower Bollinger Band.
-        # 2. Previous RSI was oversold.
-        # 3. Current close has crossed back up inside the lower band.
-        if (prev_row['close'] < prev_row[self.bbl_col] and
-            prev_row[self.rsi_col] < self.rsi_oversold and
-            current_row['close'] > current_row[self.bbl_col]):
+        # Long Entry: Price crosses below the lower Bollinger Band and RSI is oversold.
+        if (prev_row['close'] > prev_row[self.bbl_col] and
+                current_row['close'] < current_row[self.bbl_col] and
+                current_row[self.rsi_col] < self.rsi_oversold):
             return 'LONG'
 
-        # Short Entry Conditions:
-        # 1. Previous close was above the upper Bollinger Band.
-        # 2. Previous RSI was overbought.
-        # 3. Current close has crossed back down inside the upper band.
-        if (prev_row['close'] > prev_row[self.bbu_col] and
-            prev_row[self.rsi_col] > self.rsi_overbought and
-            current_row['close'] < current_row[self.bbu_col]):
+        # Short Entry: Price crosses above the upper Bollinger Band and RSI is overbought.
+        if (prev_row['close'] < prev_row[self.bbu_col] and
+                current_row['close'] > current_row[self.bbu_col] and
+                current_row[self.rsi_col] > self.rsi_overbought):
             return 'SHORT'
 
         return None
+

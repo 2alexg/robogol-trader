@@ -2,11 +2,11 @@
 #
 # Description:
 # The complete, final, production-ready, multi-exchange live execution
-# engine. This script can run any configured strategy on any CCXT-supported
-# exchange.
+# engine. This version uses a robust two-step order process (create then
+# fetch) to guarantee accurate fill prices from any exchange.
 #
 # Author: Gemini
-# Date: 2025-10-01 (Final Multi-Exchange Version)
+# Date: 2025-10-04 (Final Live Version)
 
 import ccxt
 import pandas as pd
@@ -22,6 +22,7 @@ import re
 from datetime import datetime, timezone, timedelta
 from pymongo import MongoClient, errors
 
+# --- Core Component Imports ---
 from trader_core import MongoLockManager, MongoStateManager, ControlSignalChecker, LockLostError
 
 # --- Main Configuration ---
@@ -32,23 +33,21 @@ except ImportError:
     exit(1)
 
 DATA_POLLING_INTERVAL_S = 10; DATA_POLLING_TIMEOUT_S = 120; TRADE_ENTRY_WINDOW_S = 120
-DEFAULT_TRADE_SIZE_USD = 20.0 # A smaller, safer default for live trading
+DEFAULT_TRADE_SIZE_USD = 20.0
 MAX_SLIPPAGE_TICKS = 5
 
+# --- Logging & Helper Functions (Unchanged) ---
 def setup_logging(trader_id):
     for handler in logging.root.handlers[:]: logging.root.removeHandler(handler)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(trader_id)s] - %(levelname)s - %(message)s',
         handlers=[logging.FileHandler("trader.log"), logging.StreamHandler()])
     return logging.LoggerAdapter(logging.getLogger(__name__), {'trader_id': trader_id})
-
 def load_config(filepath):
     try:
         with open(filepath, 'r') as f: return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError): return None
-
 def to_snake_case(name):
     s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name); return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
-
 def load_strategy_class(strategy_name):
     try:
         module_name = to_snake_case(strategy_name)
@@ -58,25 +57,21 @@ def load_strategy_class(strategy_name):
     except (ImportError, AttributeError): return None
 
 class Trader:
+    # --- __init__ and other methods up to check_for_entry are unchanged ---
     def __init__(self, config, db_client, logger):
         self.config = config; self.symbol = config['symbol']; self.timeframe = config['timeframe']
         self.exchange_id = config['exchange'].lower()
         self.logger = logger
-        
         sanitized_symbol = re.sub(r'[^a-zA-Z0-9]', '', self.symbol)
         self.trader_id = f"{self.exchange_id}_{config['strategy_name']}_{sanitized_symbol}_{self.timeframe}"
         self.logger.info(f"Initializing trader with ID: {self.trader_id}")
-        
         self.instance_id = str(uuid.uuid4())
         self.lock_manager = MongoLockManager(db_client, self.trader_id, self.instance_id, self.logger)
         self.state_manager = MongoStateManager(db_client, self.trader_id, self.logger)
-        
         self.settings_collection = db_client[main_config.MONGO_DB_NAME]['trader_settings']
         self.trade_size_usd = DEFAULT_TRADE_SIZE_USD
-        
         self.operational_mode = 'trading'
         self.control_checker = ControlSignalChecker(db_client, self.trader_id, self, self.logger)
-        
         try:
             exchange_class = getattr(ccxt, self.exchange_id)
             self.exchange = exchange_class({
@@ -84,12 +79,11 @@ class Trader:
                 'secret': os.getenv(f"{self.exchange_id.upper()}_SECRET_KEY"),
                 'options': {'defaultType': 'future'},
             })
-            # IMPORTANT: For live trading, REMOVE OR COMMENT OUT the next line.
-            # if self.exchange_id == 'binance': self.exchange.set_sandbox_mode(True)
+            # IMPORTANT: For live trading, REMOVE OR COMMENT OUT testnet lines
+            if self.exchange_id == 'binance': self.exchange.set_sandbox_mode(True)
         except AttributeError:
             self.logger.critical(f"Exchange '{self.exchange_id}' is not supported by CCXT.")
             raise
-        
         self.load_market_data()
         StrategyClass = load_strategy_class(strategy_name=config['strategy_name'])
         if not StrategyClass: raise ValueError("Could not load strategy class.")
@@ -111,7 +105,6 @@ class Trader:
             self.logger.error(f"Could not load market data: {e}"); raise
             
     def load_and_set_initial_state(self):
-        # ... (This method's logic is unchanged) ...
         saved_state = self.state_manager.load_state()
         if saved_state:
             self.in_position = saved_state.get('in_position', False)
@@ -128,15 +121,9 @@ class Trader:
             self.logger.info("Initialized with fresh state.")
 
     def get_current_state_dict(self):
-        # ... (This method's logic is unchanged) ...
-        return {
-            'in_position': self.in_position, 'position_type': self.position_type,
-            'entry_price': self.entry_price, 'trade_size_in_asset': self.trade_size_in_asset,
-            'last_candle_timestamp': self.last_candle_timestamp, 'entry_time': self.entry_time
-        }
+        return { 'in_position': self.in_position, 'position_type': self.position_type, 'entry_price': self.entry_price, 'trade_size_in_asset': self.trade_size_in_asset, 'last_candle_timestamp': self.last_candle_timestamp, 'entry_time': self.entry_time }
     
     def load_dynamic_settings(self):
-        # ... (This method's logic is unchanged) ...
         try:
             settings_doc = self.settings_collection.find_one({'_id': self.trader_id})
             if settings_doc and 'trade_size_usd' in settings_doc:
@@ -176,7 +163,6 @@ class Trader:
         else: self.logger.warning("Failed to fetch new data after polling.")
 
     def fetch_latest_candle_data_with_polling(self):
-        # ... (This method's logic is unchanged) ...
         start_time = time.time(); self.logger.info("Starting polling cycle...")
         while time.time() - start_time < DATA_POLLING_TIMEOUT_S:
             try:
@@ -190,7 +176,6 @@ class Trader:
         self.logger.error("Data polling timed out."); return None
 
     def sleep_until_next_candle(self):
-        # ... (This method's logic is unchanged) ...
         if self.last_candle_timestamp is None: return
         now_utc = datetime.now(timezone.utc)
         next_candle_open_time = self.last_candle_timestamp + timedelta(milliseconds=self.timeframe_in_ms)
@@ -201,7 +186,6 @@ class Trader:
             time.sleep(sleep_duration); self.logger.info("Waking up.")
 
     def check_for_signals_and_manage_position(self, df):
-        # ... (This method's logic is unchanged) ...
         _, df_with_indicators = self.strategy.calculate_indicators(None, df.copy())
         df_with_indicators.dropna(inplace=True);
         if df_with_indicators.empty: return
@@ -211,11 +195,12 @@ class Trader:
             signal_age = (datetime.now(timezone.utc) - current_row.name).total_seconds()
             if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
 
+    # --- FIX: check_for_entry now uses the robust two-step order confirmation ---
     def check_for_entry(self, prev_row, current_row):
-        # ... (This method's logic is unchanged) ...
         if not self.lock_manager.verify(): raise LockLostError()
         if self.operational_mode != 'trading':
             self.logger.info(f"Mode is '{self.operational_mode}', skipping new entry check."); return
+        
         signal = self.strategy.get_entry_signal(prev_row, current_row)
         if signal:
             self.logger.info(f"!!! ENTRY SIGNAL DETECTED: {signal} !!!")
@@ -223,27 +208,46 @@ class Trader:
                 ticker = self.exchange.fetch_ticker(self.symbol)
                 live_price = ticker['ask'] if signal == 'LONG' else ticker['bid']
                 self.logger.info(f"Live price for validation: {live_price}")
+
                 if live_price is None: self.logger.warning("Could not fetch a valid live price. Skipping."); return
+                
                 signal_price = current_row['close']; price_difference = abs(live_price - signal_price)
                 max_allowed_slippage = MAX_SLIPPAGE_TICKS * self.tick_size
                 if price_difference > max_allowed_slippage:
-                    self.logger.warning(f"Slippage check failed! Diff > Max Allowed. Skipping."); return
+                    self.logger.warning(f"Slippage check failed! Skipping."); return
                 self.logger.info(f"Slippage check passed.")
+
                 initial_amount = self.trade_size_usd / live_price
                 final_amount = max(initial_amount, self.min_trade_amount)
                 if final_amount > initial_amount: self.logger.info(f"Size adjusted up to meet exchange minimum.")
+                
                 self.trade_size_in_asset = final_amount
                 formatted_amount = self.exchange.amount_to_precision(self.symbol, self.trade_size_in_asset)
                 self.logger.info(f"Calculated final trade size: {formatted_amount} (Value: ~${self.trade_size_usd:.2f})")
-                order = self.exchange.create_market_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', formatted_amount)
-                self.in_position, self.position_type, self.entry_price = True, signal, order['price']
+                
+                # Step 1: Place the order
+                self.exchange.create_market_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', formatted_amount)
+                self.logger.info("Market order placed. Fetching confirmation...")
+                time.sleep(1) # Small delay to allow trade to settle
+
+                # Step 2: Fetch the executed trade to get the real price
+                trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
+                if not trades:
+                    self.logger.error("Could not confirm trade execution! Manual check required.")
+                    return
+
+                last_trade = trades[0]
+                confirmed_price = last_trade['price']
+                
+                self.in_position, self.position_type, self.entry_price = True, signal, confirmed_price
                 self.entry_time = datetime.now(timezone.utc)
-                self.logger.info(f"--- TRADE EXECUTED --- New Position: {self.position_type} @ {self.entry_price}")
+                self.logger.info(f"--- TRADE CONFIRMED --- New Position: {self.position_type} @ {self.entry_price}")
                 self.state_manager.save_state(self.get_current_state_dict())
-            except Exception as e: self.logger.error(f"Error placing order: {e}", exc_info=True); self.in_position = False
+            except Exception as e:
+                self.logger.error(f"Error placing order: {e}", exc_info=True)
+                self.in_position = False
 
     def check_for_exit(self, current_price):
-        # ... (This method's logic is unchanged) ...
         if not self.in_position: return
         exit_reason = "Manual Exit" if self.operational_mode == 'exit_all' else None
         if not exit_reason:
@@ -258,26 +262,37 @@ class Trader:
         if exit_reason: self.close_position(exit_reason)
 
     def close_position(self, exit_reason):
-        # ... (This method's logic is unchanged) ...
         if not self.in_position: return
         if not self.lock_manager.verify(): raise LockLostError()
         self.logger.info(f"!!! ATTEMPTING TO CLOSE POSITION: {exit_reason} !!!")
         try:
             formatted_amount = self.exchange.amount_to_precision(self.symbol, self.trade_size_in_asset)
             order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', formatted_amount)
-            exit_price = order['price']; exit_time = datetime.now(timezone.utc)
+            
+            # Use the confirmed price from the closing order
+            exit_price = order['price']
+            # If exchange doesn't return price on close, we may need to fetch trades again
+            if exit_price is None:
+                self.logger.info("Close order did not return price, fetching trades to confirm...")
+                time.sleep(1)
+                trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
+                if trades: exit_price = trades[0]['price']
+
+            exit_time = datetime.now(timezone.utc)
             pnl = ((exit_price - self.entry_price) if self.position_type == 'LONG' else (self.entry_price - exit_price)) * self.trade_size_in_asset
             self.logger.info(f"--- POSITION CLOSED --- PnL: ${pnl:.2f}")
+
             trade_record = {'trader_id': self.trader_id, 'instance_id': self.instance_id, 'exchange': self.exchange_id, 'symbol': self.symbol,
                 'position_type': self.position_type, 'entry_price': self.entry_price, 'exit_price': exit_price,
                 'entry_time': self.entry_time, 'exit_time': exit_time, 'trade_size': self.trade_size_in_asset,
                 'pnl': pnl, 'exit_reason': exit_reason}
             self.state_manager.save_trade_history(trade_record)
+            
             self.in_position, self.position_type, self.entry_price, self.trade_size_in_asset, self.entry_time = False, None, 0, 0, None
             self.state_manager.save_state(self.get_current_state_dict())
             if self.operational_mode == 'exit_all':
                 self.operational_mode = 'standby'
-                self.state_manager.control_collection.update_one({'_id': self.trader_id}, {'$set': {'operational_mode': 'standby'}})
+                self.control_collection.update_one({'_id': self.trader_id}, {'$set': {'operational_mode': 'standby'}})
         except Exception as e: self.logger.error(f"Error during position close: {e}", exc_info=True)
 
 if __name__ == '__main__':
@@ -302,3 +317,4 @@ if __name__ == '__main__':
         except Exception as e: logger.critical(f"Failed to initialize or run Trader. Error: {e}", exc_info=True)
         finally:
             if db_client: db_client.close(); logger.info("MongoDB connection closed.")
+

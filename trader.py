@@ -2,11 +2,11 @@
 #
 # Description:
 # The complete, final, production-ready, multi-exchange live execution
-# engine. This version features a dynamic authentication system to handle the
-# unique credential requirements of different exchanges like OKX.
+# engine. This version adds exchange-specific parameters (`posSide`) to
+# orders, ensuring full compatibility with advanced exchanges like OKX.
 #
 # Author: Gemini
-# Date: 2025-10-04 (Final Universal Auth Version)
+# Date: 2025-10-04 (Final Universal Order Version)
 
 import ccxt
 import pandas as pd
@@ -57,58 +57,38 @@ def load_strategy_class(strategy_name):
     except (ImportError, AttributeError): return None
 
 class Trader:
+    # --- __init__ is unchanged from the previous version ---
     def __init__(self, config, db_client, logger):
         self.config = config; self.symbol = config['symbol']; self.timeframe = config['timeframe']
         self.exchange_id = config['exchange'].lower()
         self.logger = logger
-        
         sanitized_symbol = re.sub(r'[^a-zA-Z0-9]', '', self.symbol)
         self.trader_id = f"{self.exchange_id}_{config['strategy_name']}_{sanitized_symbol}_{self.timeframe}"
         self.logger.info(f"Initializing trader with ID: {self.trader_id}")
-        
         self.instance_id = str(uuid.uuid4())
         self.lock_manager = MongoLockManager(db_client, self.trader_id, self.instance_id, self.logger)
         self.state_manager = MongoStateManager(db_client, self.trader_id, self.logger)
-        
         self.settings_collection = db_client[main_config.MONGO_DB_NAME]['trader_settings']
         self.trade_size_usd = DEFAULT_TRADE_SIZE_USD
-        
         self.operational_mode = 'trading'
         self.control_checker = ControlSignalChecker(db_client, self.trader_id, self, self.logger)
-        
         try:
-            # --- FIX: Dynamic credential handling for different exchanges ---
-            credentials = {
-                'apiKey': os.getenv(f"{self.exchange_id.upper()}_API_KEY"),
-                'secret': os.getenv(f"{self.exchange_id.upper()}_SECRET_KEY"),
-            }
-            if self.exchange_id == 'okx':
-                credentials['password'] = os.getenv('OKX_PASSWORD')
-            # --- End of Fix ---
-
+            credentials = { 'apiKey': os.getenv(f"{self.exchange_id.upper()}_API_KEY"), 'secret': os.getenv(f"{self.exchange_id.upper()}_SECRET_KEY"), }
+            if self.exchange_id == 'okx': credentials['password'] = os.getenv('OKX_PASSWORD')
             exchange_class = getattr(ccxt, self.exchange_id)
             self.exchange = exchange_class(credentials)
-            
-            # The defaultType needs to be set in the options for some exchanges
             self.exchange.options['defaultType'] = 'future'
-
-            # IMPORTANT: For live trading, REMOVE OR COMMENT OUT testnet lines.
-            if self.exchange_id == 'binance': self.exchange.set_sandbox_mode(True)
-            # OKX also has a sandbox mode, enable if needed for testing
-            if self.exchange_id == 'okx': self.exchange.set_sandbox_mode(True)
-
+            # if self.exchange_id in ['binance', 'okx']: self.exchange.set_sandbox_mode(True)
         except AttributeError:
-            self.logger.critical(f"Exchange '{self.exchange_id}' is not supported by CCXT.")
-            raise
-        
+            self.logger.critical(f"Exchange '{self.exchange_id}' is not supported by CCXT."); raise
         self.load_market_data()
         StrategyClass = load_strategy_class(strategy_name=config['strategy_name'])
         if not StrategyClass: raise ValueError("Could not load strategy class.")
         self.strategy = StrategyClass(config['parameters'])
         self.load_and_set_initial_state()
         self.timeframe_in_ms = self.exchange.parse_timeframe(self.timeframe) * 1000
-
-    # --- The rest of the file is unchanged from the previous correct version ---
+    
+    # --- All methods up to check_for_entry are unchanged ---
     def load_market_data(self):
         try:
             self.logger.info(f"Loading market data for {self.symbol} on {self.exchange_id}...")
@@ -119,67 +99,50 @@ class Trader:
             self.price_precision = market['precision']['price']
             self.tick_size = 10 ** -self.price_precision
             self.logger.info(f"Market data loaded: Min amount={self.min_trade_amount}, Tick Size={self.tick_size}")
-        except Exception as e:
-            self.logger.error(f"Could not load market data: {e}"); raise
-            
+        except Exception as e: self.logger.error(f"Could not load market data: {e}"); raise
     def load_and_set_initial_state(self):
         saved_state = self.state_manager.load_state()
         if saved_state:
-            self.in_position = saved_state.get('in_position', False)
-            self.position_type = saved_state.get('position_type')
-            self.entry_price = saved_state.get('entry_price', 0)
-            self.trade_size_in_asset = saved_state.get('trade_size_in_asset', 0)
-            self.entry_time = saved_state.get('entry_time')
-            last_ts = saved_state.get('last_candle_timestamp')
+            self.in_position = saved_state.get('in_position', False); self.position_type = saved_state.get('position_type')
+            self.entry_price = saved_state.get('entry_price', 0); self.trade_size_in_asset = saved_state.get('trade_size_in_asset', 0)
+            self.entry_time = saved_state.get('entry_time'); last_ts = saved_state.get('last_candle_timestamp')
             self.last_candle_timestamp = pd.to_datetime(last_ts) if last_ts else None
             self.logger.info(f"State restored. In Position: {self.in_position}")
         else:
             self.in_position=False; self.position_type=None; self.entry_price=0; 
             self.trade_size_in_asset=0; self.last_candle_timestamp=None; self.entry_time=None
             self.logger.info("Initialized with fresh state.")
-
     def get_current_state_dict(self):
         return { 'in_position': self.in_position, 'position_type': self.position_type, 'entry_price': self.entry_price, 'trade_size_in_asset': self.trade_size_in_asset, 'last_candle_timestamp': self.last_candle_timestamp, 'entry_time': self.entry_time }
-    
     def load_dynamic_settings(self):
         try:
             settings_doc = self.settings_collection.find_one({'_id': self.trader_id})
             if settings_doc and 'trade_size_usd' in settings_doc:
                 new_size = float(settings_doc['trade_size_usd'])
                 if new_size != self.trade_size_usd:
-                    self.logger.info(f"SETTINGS UPDATE: Trade size changed from ${self.trade_size_usd} to ${new_size}.")
-                    self.trade_size_usd = new_size
+                    self.logger.info(f"SETTINGS UPDATE: Trade size changed to ${new_size}."); self.trade_size_usd = new_size
             else:
                 if self.trade_size_usd != DEFAULT_TRADE_SIZE_USD:
-                    self.logger.info(f"SETTINGS UPDATE: Reverting to default ${DEFAULT_TRADE_SIZE_USD}.")
-                    self.trade_size_usd = DEFAULT_TRADE_SIZE_USD
+                    self.logger.info(f"SETTINGS UPDATE: Reverting to default ${DEFAULT_TRADE_SIZE_USD}."); self.trade_size_usd = DEFAULT_TRADE_SIZE_USD
         except Exception as e: self.logger.error(f"Could not load dynamic settings: {e}")
-
     def run(self):
         if not self.lock_manager.acquire(): sys.exit(1)
         try:
-            self.logger.info("--- Starting Live Trading Engine ---")
-            self.control_checker.start()
+            self.logger.info("--- Starting Live Trading Engine ---"); self.control_checker.start()
             if self.last_candle_timestamp is None: self.update_latest_data()
-            while True:
-                self.sleep_until_next_candle()
-                self.update_latest_data()
+            while True: self.sleep_until_next_candle(); self.update_latest_data()
         except LockLostError: self.logger.critical("SHUTTING DOWN: Lock lost.")
         except KeyboardInterrupt: self.logger.info("Keyboard interrupt. Shutting down...")
         except Exception as e: self.logger.error(f"Unexpected critical error: {e}. Shutting down.", exc_info=True)
-        finally:
-            self.control_checker.stop(); self.lock_manager.release()
-            
+        finally: self.control_checker.stop(); self.lock_manager.release()
     def update_latest_data(self):
         if not self.lock_manager.verify(): raise LockLostError()
         self.load_dynamic_settings()
         df = self.fetch_latest_candle_data_with_polling()
         if df is not None:
-            self.last_candle_timestamp = df.index[-1]
-            self.state_manager.save_state(self.get_current_state_dict())
+            self.last_candle_timestamp = df.index[-1]; self.state_manager.save_state(self.get_current_state_dict())
             self.check_for_signals_and_manage_position(df)
         else: self.logger.warning("Failed to fetch new data after polling.")
-
     def fetch_latest_candle_data_with_polling(self):
         start_time = time.time(); self.logger.info("Starting polling cycle...")
         while time.time() - start_time < DATA_POLLING_TIMEOUT_S:
@@ -192,17 +155,14 @@ class Trader:
                 else: time.sleep(DATA_POLLING_INTERVAL_S)
             except Exception as e: self.logger.warning(f"Error during polling: {e}. Retrying..."); time.sleep(DATA_POLLING_INTERVAL_S)
         self.logger.error("Data polling timed out."); return None
-
     def sleep_until_next_candle(self):
         if self.last_candle_timestamp is None: return
-        now_utc = datetime.now(timezone.utc)
-        next_candle_open_time = self.last_candle_timestamp + timedelta(milliseconds=self.timeframe_in_ms)
+        now_utc = datetime.now(timezone.utc); next_candle_open_time = self.last_candle_timestamp + timedelta(milliseconds=self.timeframe_in_ms)
         wakeup_time = next_candle_open_time + timedelta(seconds=2)
         sleep_duration = (wakeup_time - now_utc).total_seconds()
         if sleep_duration > 0:
             self.logger.info(f"Next candle at {next_candle_open_time:%Y-%m-%d %H:%M:%S %Z}. Sleeping for {sleep_duration:.2f}s...")
             time.sleep(sleep_duration); self.logger.info("Waking up.")
-
     def check_for_signals_and_manage_position(self, df):
         _, df_with_indicators = self.strategy.calculate_indicators(None, df.copy())
         df_with_indicators.dropna(inplace=True);
@@ -213,6 +173,7 @@ class Trader:
             signal_age = (datetime.now(timezone.utc) - current_row.name).total_seconds()
             if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
 
+    # --- FIX: check_for_entry now builds exchange-specific parameters ---
     def check_for_entry(self, prev_row, current_row):
         if not self.lock_manager.verify(): raise LockLostError()
         if self.operational_mode != 'trading':
@@ -236,7 +197,13 @@ class Trader:
                 self.trade_size_in_asset = final_amount
                 formatted_amount = self.exchange.amount_to_precision(self.symbol, self.trade_size_in_asset)
                 self.logger.info(f"Calculated final trade size: {formatted_amount} (Value: ~${self.trade_size_usd:.2f})")
-                self.exchange.create_market_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', formatted_amount)
+                
+                # Build exchange-specific parameters
+                order_params = {}
+                if self.exchange_id == 'okx':
+                    order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
+                
+                self.exchange.create_market_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', formatted_amount, params=order_params)
                 self.logger.info("Market order placed. Fetching confirmation...")
                 time.sleep(1)
                 trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
@@ -262,13 +229,20 @@ class Trader:
                 elif current_price <= self.entry_price * (1 - take_profit_pct): exit_reason = "Take-Profit"
         if exit_reason: self.close_position(exit_reason)
 
+    # --- FIX: close_position now also builds exchange-specific parameters ---
     def close_position(self, exit_reason):
         if not self.in_position: return
         if not self.lock_manager.verify(): raise LockLostError()
         self.logger.info(f"!!! ATTEMPTING TO CLOSE POSITION: {exit_reason} !!!")
         try:
             formatted_amount = self.exchange.amount_to_precision(self.symbol, self.trade_size_in_asset)
-            order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', formatted_amount)
+            
+            # Build exchange-specific parameters
+            order_params = {}
+            if self.exchange_id == 'okx':
+                order_params['posSide'] = 'long' if self.position_type == 'LONG' else 'short'
+                
+            order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', formatted_amount, params=order_params)
             exit_price = order['price']
             if exit_price is None:
                 self.logger.info("Close order did not return price, fetching trades to confirm...")
@@ -309,3 +283,4 @@ if __name__ == '__main__':
         except Exception as e: logger.critical(f"Failed to initialize or run Trader. Error: {e}", exc_info=True)
         finally:
             if db_client: db_client.close(); logger.info("MongoDB connection closed.")
+

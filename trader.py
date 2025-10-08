@@ -2,11 +2,11 @@
 #
 # Description:
 # The complete, final, production-ready, multi-exchange live execution
-# engine. This version adds exchange-specific parameters (`posSide`) to
-# orders, ensuring full compatibility with advanced exchanges like OKX.
+# engine. This version includes a robust fallback to `fetch_bids_asks` to
+# handle Binance's lack of bid/ask data in its standard ticker response.
 #
 # Author: Gemini
-# Date: 2025-10-04 (Final Universal Order Version)
+# Date: 2025-10-07 (Final Live Version)
 
 import ccxt
 import pandas as pd
@@ -26,7 +26,6 @@ from pymongo import MongoClient, errors
 from trader_core import MongoLockManager, MongoStateManager, ControlSignalChecker, LockLostError
 
 # --- Main Configuration & Helper Functions (Unchanged) ---
-# ... (These are identical to the previous version) ...
 try:
     import config as main_config
 except ImportError:
@@ -57,7 +56,6 @@ def load_strategy_class(strategy_name):
     except (ImportError, AttributeError): return None
 
 class Trader:
-    # --- __init__ is unchanged from the previous version ---
     def __init__(self, config, db_client, logger):
         self.config = config; self.symbol = config['symbol']; self.timeframe = config['timeframe']
         self.exchange_id = config['exchange'].lower()
@@ -87,8 +85,7 @@ class Trader:
         self.strategy = StrategyClass(config['parameters'])
         self.load_and_set_initial_state()
         self.timeframe_in_ms = self.exchange.parse_timeframe(self.timeframe) * 1000
-    
-    # --- All methods up to check_for_entry are unchanged ---
+
     def load_market_data(self):
         try:
             self.logger.info(f"Loading market data for {self.symbol} on {self.exchange_id}...")
@@ -98,8 +95,11 @@ class Trader:
             self.min_trade_amount = market['limits']['amount']['min']
             self.price_precision = market['precision']['price']
             self.tick_size = 10 ** -self.price_precision
-            self.logger.info(f"Market data loaded: Min amount={self.min_trade_amount}, Tick Size={self.tick_size}")
-        except Exception as e: self.logger.error(f"Could not load market data: {e}"); raise
+            self.contract_size = market.get('contractSize', 1.0)
+            self.logger.info(f"Market data loaded: Min amount={self.min_trade_amount}, Tick Size={self.tick_size}, Contract Size={self.contract_size}")
+        except Exception as e:
+            self.logger.error(f"Could not load market data: {e}"); raise
+            
     def load_and_set_initial_state(self):
         saved_state = self.state_manager.load_state()
         if saved_state:
@@ -173,7 +173,7 @@ class Trader:
             signal_age = (datetime.now(timezone.utc) - current_row.name).total_seconds()
             if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
 
-    # --- FIX: check_for_entry now builds exchange-specific parameters ---
+    # --- FIX: check_for_entry now includes the Binance-specific price fetch fallback ---
     def check_for_entry(self, prev_row, current_row):
         if not self.lock_manager.verify(): raise LockLostError()
         if self.operational_mode != 'trading':
@@ -184,28 +184,41 @@ class Trader:
             try:
                 ticker = self.exchange.fetch_ticker(self.symbol)
                 live_price = ticker['ask'] if signal == 'LONG' else ticker['bid']
+                
+                # --- FIX: If price is None and exchange is Binance, fetch from order book ---
+                if live_price is None and self.exchange_id == 'binance':
+                    self.logger.info("Binance ticker has no bid/ask, fetching from order book...")
+                    bids_asks = self.exchange.fetch_bids_asks([self.symbol])
+                    symbol_data = bids_asks.get(self.symbol)
+                    if symbol_data:
+                        live_price = symbol_data['ask'] if signal == 'LONG' else symbol_data['bid']
+
                 self.logger.info(f"Live price for validation: {live_price}")
                 if live_price is None: self.logger.warning("Could not fetch a valid live price. Skipping."); return
+                
                 signal_price = current_row['close']; price_difference = abs(live_price - signal_price)
                 max_allowed_slippage = MAX_SLIPPAGE_TICKS * self.tick_size
                 if price_difference > max_allowed_slippage:
                     self.logger.warning(f"Slippage check failed! Skipping."); return
                 self.logger.info(f"Slippage check passed.")
-                initial_amount = self.trade_size_usd / live_price
-                final_amount = max(initial_amount, self.min_trade_amount)
-                if final_amount > initial_amount: self.logger.info(f"Size adjusted up to meet exchange minimum.")
-                self.trade_size_in_asset = final_amount
-                formatted_amount = self.exchange.amount_to_precision(self.symbol, self.trade_size_in_asset)
-                self.logger.info(f"Calculated final trade size: {formatted_amount} (Value: ~${self.trade_size_usd:.2f})")
                 
-                # Build exchange-specific parameters
-                order_params = {}
-                if self.exchange_id == 'okx':
-                    order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
+                desired_amount_in_asset = self.trade_size_usd / live_price
+                final_amount_in_asset = max(desired_amount_in_asset, self.min_trade_amount)
                 
-                self.exchange.create_market_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', formatted_amount, params=order_params)
+                if final_amount_in_asset > desired_amount_in_asset: self.logger.info(f"Size adjusted up to meet exchange minimum.")
+                
+                quantity_in_contracts = final_amount_in_asset / self.contract_size
+                formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
+                self.trade_size_in_asset = final_amount_in_asset
+                
+                self.logger.info(f"Calculated final order: {formatted_amount} contracts (True Size: {self.trade_size_in_asset:.8f} {self.symbol.split('/')[0]})")
+                
+                order_params = {};
+                if self.exchange_id == 'okx': order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
+                
+                self.exchange.create_market_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), params=order_params)
                 self.logger.info("Market order placed. Fetching confirmation...")
-                time.sleep(1)
+                time.sleep(1) # Allow time for trade to settle
                 trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
                 if not trades: self.logger.error("Could not confirm trade execution! Manual check required."); return
                 last_trade = trades[0]; confirmed_price = last_trade['price']
@@ -229,20 +242,16 @@ class Trader:
                 elif current_price <= self.entry_price * (1 - take_profit_pct): exit_reason = "Take-Profit"
         if exit_reason: self.close_position(exit_reason)
 
-    # --- FIX: close_position now also builds exchange-specific parameters ---
     def close_position(self, exit_reason):
         if not self.in_position: return
         if not self.lock_manager.verify(): raise LockLostError()
         self.logger.info(f"!!! ATTEMPTING TO CLOSE POSITION: {exit_reason} !!!")
         try:
-            formatted_amount = self.exchange.amount_to_precision(self.symbol, self.trade_size_in_asset)
-            
-            # Build exchange-specific parameters
+            quantity_in_contracts = self.trade_size_in_asset / self.contract_size
+            formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
             order_params = {}
-            if self.exchange_id == 'okx':
-                order_params['posSide'] = 'long' if self.position_type == 'LONG' else 'short'
-                
-            order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', formatted_amount, params=order_params)
+            if self.exchange_id == 'okx': order_params['posSide'] = 'long' if self.position_type == 'LONG' else 'short'
+            order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
             exit_price = order['price']
             if exit_price is None:
                 self.logger.info("Close order did not return price, fetching trades to confirm...")

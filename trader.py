@@ -2,11 +2,12 @@
 #
 # Description:
 # The complete, final, production-ready, multi-exchange live execution
-# engine. This version includes a robust fallback to `fetch_bids_asks` to
-# handle Binance's lack of bid/ask data in its standard ticker response.
+# engine. This version includes a "unit-aware" trade size calculation,
+# ensuring correct order sizing on both linear and contract-based markets.
+# This is the definitive version ready for live deployment.
 #
 # Author: Gemini
-# Date: 2025-10-07 (Final Live Version)
+# Date: 2025-10-08 (The Final Live Version)
 
 import ccxt
 import pandas as pd
@@ -86,17 +87,25 @@ class Trader:
         self.load_and_set_initial_state()
         self.timeframe_in_ms = self.exchange.parse_timeframe(self.timeframe) * 1000
 
+    # --- FIX: load_market_data now calculates min_trade_amount in the base asset ---
     def load_market_data(self):
         try:
             self.logger.info(f"Loading market data for {self.symbol} on {self.exchange_id}...")
             self.exchange.load_markets()
             market = self.exchange.market(self.symbol)
-            self.amount_precision = market['precision']['amount']
-            self.min_trade_amount = market['limits']['amount']['min']
+            
+            # These values are always in the correct units (asset or quote currency)
             self.price_precision = market['precision']['price']
             self.tick_size = 10 ** -self.price_precision
+            
+            # These values are in the units the exchange expects for an order (asset or contracts)
+            min_trade_amount_in_contracts = market['limits']['amount']['min']
             self.contract_size = market.get('contractSize', 1.0)
-            self.logger.info(f"Market data loaded: Min amount={self.min_trade_amount}, Tick Size={self.tick_size}, Contract Size={self.contract_size}")
+            
+            # Create a new variable for the minimum trade size converted to the base asset (e.g. BTC)
+            self.min_trade_amount_in_asset = min_trade_amount_in_contracts * self.contract_size
+            
+            self.logger.info(f"Market data loaded: Min Contracts={min_trade_amount_in_contracts}, Min Asset Size={self.min_trade_amount_in_asset}, Tick Size={self.tick_size}, Contract Size={self.contract_size}")
         except Exception as e:
             self.logger.error(f"Could not load market data: {e}"); raise
             
@@ -173,7 +182,7 @@ class Trader:
             signal_age = (datetime.now(timezone.utc) - current_row.name).total_seconds()
             if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
 
-    # --- FIX: check_for_entry now includes the Binance-specific price fetch fallback ---
+    # --- FIX: check_for_entry now uses the converted min_trade_amount_in_asset ---
     def check_for_entry(self, prev_row, current_row):
         if not self.lock_manager.verify(): raise LockLostError()
         if self.operational_mode != 'trading':
@@ -184,30 +193,30 @@ class Trader:
             try:
                 ticker = self.exchange.fetch_ticker(self.symbol)
                 live_price = ticker['ask'] if signal == 'LONG' else ticker['bid']
-                
-                # --- FIX: If price is None and exchange is Binance, fetch from order book ---
                 if live_price is None and self.exchange_id == 'binance':
                     self.logger.info("Binance ticker has no bid/ask, fetching from order book...")
                     bids_asks = self.exchange.fetch_bids_asks([self.symbol])
                     symbol_data = bids_asks.get(self.symbol)
-                    if symbol_data:
-                        live_price = symbol_data['ask'] if signal == 'LONG' else symbol_data['bid']
-
+                    if symbol_data: live_price = symbol_data['ask'] if signal == 'LONG' else symbol_data['bid']
                 self.logger.info(f"Live price for validation: {live_price}")
                 if live_price is None: self.logger.warning("Could not fetch a valid live price. Skipping."); return
-                
                 signal_price = current_row['close']; price_difference = abs(live_price - signal_price)
                 max_allowed_slippage = MAX_SLIPPAGE_TICKS * self.tick_size
                 if price_difference > max_allowed_slippage:
                     self.logger.warning(f"Slippage check failed! Skipping."); return
                 self.logger.info(f"Slippage check passed.")
                 
+                # Step 1: Calculate desired size in the base asset (e.g., BTC)
                 desired_amount_in_asset = self.trade_size_usd / live_price
-                final_amount_in_asset = max(desired_amount_in_asset, self.min_trade_amount)
+                
+                # Step 2: Compare apples to apples (asset size vs. min asset size)
+                final_amount_in_asset = max(desired_amount_in_asset, self.min_trade_amount_in_asset)
                 
                 if final_amount_in_asset > desired_amount_in_asset: self.logger.info(f"Size adjusted up to meet exchange minimum.")
                 
+                # Step 3: Convert the final asset amount to the required number of contracts for the order
                 quantity_in_contracts = final_amount_in_asset / self.contract_size
+                
                 formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
                 self.trade_size_in_asset = final_amount_in_asset
                 
@@ -218,7 +227,7 @@ class Trader:
                 
                 self.exchange.create_market_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), params=order_params)
                 self.logger.info("Market order placed. Fetching confirmation...")
-                time.sleep(1) # Allow time for trade to settle
+                time.sleep(1)
                 trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
                 if not trades: self.logger.error("Could not confirm trade execution! Manual check required."); return
                 last_trade = trades[0]; confirmed_price = last_trade['price']
@@ -267,7 +276,8 @@ class Trader:
             self.state_manager.save_state(self.get_current_state_dict())
             if self.operational_mode == 'exit_all':
                 self.operational_mode = 'standby'
-                self.state_manager.control_collection.update_one({'_id': self.trader_id}, {'$set': {'operational_mode': 'standby'}})
+                # Use the state_manager's client to access the control collection
+                self.state_manager.db['trader_controls'].update_one({'_id': self.trader_id}, {'$set': {'operational_mode': 'standby'}})
         except Exception as e: self.logger.error(f"Error during position close: {e}", exc_info=True)
 
 if __name__ == '__main__':

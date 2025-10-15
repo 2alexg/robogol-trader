@@ -2,9 +2,8 @@
 #
 # Description:
 # The complete, definitive, and production-ready multi-exchange live
-# execution engine. This final version uses a robust, orderId-based polling
-# loop to confirm the exact fill price for BOTH entries and exits, ensuring
-# a 100% reliable and accurate trade history.
+# execution engine. This final version uses a pure limit-order entry
+# system, making it a high-precision, "maker"-focused trading bot.
 #
 # Author: Gemini
 # Date: 2025-10-15 (The Definitive Final Version)
@@ -79,7 +78,6 @@ class Trader:
             exchange_class = getattr(ccxt, self.exchange_id)
             self.exchange = exchange_class(credentials)
             self.exchange.options['defaultType'] = 'future'
-            # IMPORTANT: For live trading, REMOVE OR COMMENT OUT testnet lines.
             if self.exchange_id in ['binance', 'okx']: self.exchange.set_sandbox_mode(True)
         except AttributeError:
             self.logger.critical(f"Exchange '{self.exchange_id}' is not supported by CCXT."); raise
@@ -223,7 +221,7 @@ class Trader:
                 self.logger.info(f"Successfully canceled order {order_id}.")
             except Exception as e:
                 self.logger.error(f"Failed to cancel order {order_id}. MANUAL INTERVENTION REQUIRED! Error: {e}")
-        else: # Market order
+        else:
             self.logger.error(f"MARKET order {order_id} did not fill in time. MANUAL INTERVENTION REQUIRED!")
         return None
             
@@ -235,30 +233,24 @@ class Trader:
         if signal:
             self.logger.info(f"!!! ENTRY SIGNAL DETECTED: {signal} !!!")
             try:
-                ticker = self.exchange.fetch_ticker(self.symbol)
-                live_price = ticker['ask'] if signal == 'LONG' else ticker['bid']
-                if live_price is None and self.exchange_id == 'binance':
-                    bids_asks = self.exchange.fetch_bids_asks([self.symbol])
-                    symbol_data = bids_asks.get(self.symbol)
-                    if symbol_data: live_price = symbol_data['ask'] if signal == 'LONG' else symbol_data['bid']
-                self.logger.info(f"Live price for validation: {live_price}")
-                if live_price is None: self.logger.warning("Could not fetch a valid live price. Skipping."); return
-                signal_price = current_row['close']; price_difference = abs(live_price - signal_price)
-                max_allowed_slippage = MAX_SLIPPAGE_TICKS * self.tick_size
-                if price_difference > max_allowed_slippage:
-                    self.logger.warning(f"Slippage check failed! Skipping."); return
-                self.logger.info(f"Slippage check passed.")
-                desired_amount_in_asset = self.trade_size_usd / live_price
+                # --- FIX: Use signal price for limit order, not live price ---
+                signal_price = current_row['close']
+                
+                desired_amount_in_asset = self.trade_size_usd / signal_price
                 final_amount_in_asset = max(desired_amount_in_asset, self.min_trade_amount_in_asset)
                 if final_amount_in_asset > desired_amount_in_asset: self.logger.info(f"Size adjusted up to meet exchange minimum.")
+                
                 quantity_in_contracts = final_amount_in_asset / self.contract_size
                 formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
                 self.trade_size_in_asset = final_amount_in_asset
+                
                 self.logger.info(f"Calculated final order: {formatted_amount} contracts (True Size: {self.trade_size_in_asset:.8f})")
+                
                 order_params = {};
                 if self.exchange_id == 'okx': order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
-                limit_price = self.exchange.price_to_precision(self.symbol, live_price)
-                self.logger.info(f"Placing LIMIT order at {limit_price}...")
+                
+                limit_price = self.exchange.price_to_precision(self.symbol, signal_price)
+                self.logger.info(f"Placing LIMIT order at signal price: {limit_price}...")
                 order = self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
                 order_id = order['id']
                 
@@ -324,7 +316,7 @@ class Trader:
                 exit_price_target = self.exchange.price_to_precision(self.symbol, self.take_profit_price)
                 self.logger.info(f"Placing LIMIT order at {exit_price_target}")
                 order = self.exchange.create_limit_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), float(exit_price_target), params=order_params)
-            else: # Market order for SL or Manual
+            else:
                 self.logger.info("Placing MARKET order for immediate exit.")
                 order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
 
@@ -332,10 +324,7 @@ class Trader:
 
             if confirmed_exit_price is None:
                 self.logger.error(f"Could not confirm exit for order {order['id']}. Position may still be open.")
-                # If a TP limit was missed and canceled, the position is still open, so we don't reset state.
-                if order_type == 'limit':
-                    return
-                # If a market order failed, something is critically wrong, but we must assume the position is still open.
+                if order_type == 'limit': return
                 return
 
             exit_time = datetime.now(timezone.utc)

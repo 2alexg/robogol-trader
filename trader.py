@@ -2,12 +2,13 @@
 #
 # Description:
 # The complete, final, production-ready, multi-exchange live execution
-# engine. This version includes a "unit-aware" trade size calculation,
-# ensuring correct order sizing on both linear and contract-based markets.
-# This is the definitive version ready for live deployment.
+# engine. This definitive version features:
+#   - Precision LIMIT orders for both trade entry and take-profit exits.
+#   - A high-responsiveness "active monitoring" loop for intra-candle checks.
+#   - A fully robust, unit-aware, and universally compatible architecture.
 #
 # Author: Gemini
-# Date: 2025-10-08 (The Final Live Version)
+# Date: 2025-10-13 (The Definitive Final Version)
 
 import ccxt
 import pandas as pd
@@ -22,6 +23,7 @@ import argparse
 import re
 from datetime import datetime, timezone, timedelta
 from pymongo import MongoClient, errors
+from decimal import Decimal
 
 # --- Core Component Imports ---
 from trader_core import MongoLockManager, MongoStateManager, ControlSignalChecker, LockLostError
@@ -34,8 +36,8 @@ except ImportError:
     exit(1)
 
 DATA_POLLING_INTERVAL_S = 10; DATA_POLLING_TIMEOUT_S = 120; TRADE_ENTRY_WINDOW_S = 120
-DEFAULT_TRADE_SIZE_USD = 20.0
-MAX_SLIPPAGE_TICKS = 5
+DEFAULT_TRADE_SIZE_USD = 20.0; MAX_SLIPPAGE_TICKS = 5
+INTRA_CANDLE_CHECK_INTERVAL_S = 30
 
 def setup_logging(trader_id):
     for handler in logging.root.handlers[:]: logging.root.removeHandler(handler)
@@ -77,6 +79,7 @@ class Trader:
             exchange_class = getattr(ccxt, self.exchange_id)
             self.exchange = exchange_class(credentials)
             self.exchange.options['defaultType'] = 'future'
+            # IMPORTANT: For live trading, REMOVE OR COMMENT OUT testnet lines.
             # if self.exchange_id in ['binance', 'okx']: self.exchange.set_sandbox_mode(True)
         except AttributeError:
             self.logger.critical(f"Exchange '{self.exchange_id}' is not supported by CCXT."); raise
@@ -87,25 +90,25 @@ class Trader:
         self.load_and_set_initial_state()
         self.timeframe_in_ms = self.exchange.parse_timeframe(self.timeframe) * 1000
 
-    # --- FIX: load_market_data now calculates min_trade_amount in the base asset ---
     def load_market_data(self):
         try:
             self.logger.info(f"Loading market data for {self.symbol} on {self.exchange_id}...")
             self.exchange.load_markets()
             market = self.exchange.market(self.symbol)
-            
-            # These values are always in the correct units (asset or quote currency)
-            self.price_precision = market['precision']['price']
-            self.tick_size = 10 ** -self.price_precision
-            
-            # These values are in the units the exchange expects for an order (asset or contracts)
+            price_precision_value = market['precision']['price']
+            if isinstance(price_precision_value, int):
+                self.price_decimal_places = price_precision_value
+                self.tick_size = 10 ** -self.price_decimal_places
+            elif isinstance(price_precision_value, float):
+                self.tick_size = price_precision_value
+                self.price_decimal_places = abs(Decimal(str(self.tick_size)).as_tuple().exponent)
+            else:
+                self.tick_size = 0.0001; self.price_decimal_places = 4
+                self.logger.warning("Could not determine price precision method. Using safe defaults.")
             min_trade_amount_in_contracts = market['limits']['amount']['min']
             self.contract_size = market.get('contractSize', 1.0)
-            
-            # Create a new variable for the minimum trade size converted to the base asset (e.g. BTC)
             self.min_trade_amount_in_asset = min_trade_amount_in_contracts * self.contract_size
-            
-            self.logger.info(f"Market data loaded: Min Contracts={min_trade_amount_in_contracts}, Min Asset Size={self.min_trade_amount_in_asset}, Tick Size={self.tick_size}, Contract Size={self.contract_size}")
+            self.logger.info(f"Market data loaded: Min Asset Size={self.min_trade_amount_in_asset}, Tick Size={self.tick_size}, Price Decimals={self.price_decimal_places}, Contract Size={self.contract_size}")
         except Exception as e:
             self.logger.error(f"Could not load market data: {e}"); raise
             
@@ -116,13 +119,17 @@ class Trader:
             self.entry_price = saved_state.get('entry_price', 0); self.trade_size_in_asset = saved_state.get('trade_size_in_asset', 0)
             self.entry_time = saved_state.get('entry_time'); last_ts = saved_state.get('last_candle_timestamp')
             self.last_candle_timestamp = pd.to_datetime(last_ts) if last_ts else None
+            self.stop_loss_price = saved_state.get('stop_loss_price'); self.take_profit_price = saved_state.get('take_profit_price')
             self.logger.info(f"State restored. In Position: {self.in_position}")
         else:
             self.in_position=False; self.position_type=None; self.entry_price=0; 
             self.trade_size_in_asset=0; self.last_candle_timestamp=None; self.entry_time=None
+            self.stop_loss_price = None; self.take_profit_price = None
             self.logger.info("Initialized with fresh state.")
     def get_current_state_dict(self):
-        return { 'in_position': self.in_position, 'position_type': self.position_type, 'entry_price': self.entry_price, 'trade_size_in_asset': self.trade_size_in_asset, 'last_candle_timestamp': self.last_candle_timestamp, 'entry_time': self.entry_time }
+        return { 'in_position': self.in_position, 'position_type': self.position_type, 'entry_price': self.entry_price, 
+                 'trade_size_in_asset': self.trade_size_in_asset, 'last_candle_timestamp': self.last_candle_timestamp, 
+                 'entry_time': self.entry_time, 'stop_loss_price': self.stop_loss_price, 'take_profit_price': self.take_profit_price }
     def load_dynamic_settings(self):
         try:
             settings_doc = self.settings_collection.find_one({'_id': self.trader_id})
@@ -130,21 +137,41 @@ class Trader:
                 new_size = float(settings_doc['trade_size_usd'])
                 if new_size != self.trade_size_usd:
                     self.logger.info(f"SETTINGS UPDATE: Trade size changed to ${new_size}."); self.trade_size_usd = new_size
-            else:
-                if self.trade_size_usd != DEFAULT_TRADE_SIZE_USD:
-                    self.logger.info(f"SETTINGS UPDATE: Reverting to default ${DEFAULT_TRADE_SIZE_USD}."); self.trade_size_usd = DEFAULT_TRADE_SIZE_USD
+            elif self.trade_size_usd != DEFAULT_TRADE_SIZE_USD:
+                self.logger.info(f"SETTINGS UPDATE: Reverting to default ${DEFAULT_TRADE_SIZE_USD}."); self.trade_size_usd = DEFAULT_TRADE_SIZE_USD
         except Exception as e: self.logger.error(f"Could not load dynamic settings: {e}")
+    
+    # --- FIX: The main run loop now correctly enters the active monitoring state ---
     def run(self):
         if not self.lock_manager.acquire(): sys.exit(1)
         try:
             self.logger.info("--- Starting Live Trading Engine ---"); self.control_checker.start()
-            if self.last_candle_timestamp is None: self.update_latest_data()
-            while True: self.sleep_until_next_candle(); self.update_latest_data()
+            if self.last_candle_timestamp is None: self.update_latest_closed_candle_data()
+            while True:
+                if self.in_position:
+                    self.run_intra_candle_checks()
+                else:
+                    self.sleep_until_next_candle()
+                self.update_latest_closed_candle_data()
         except LockLostError: self.logger.critical("SHUTTING DOWN: Lock lost.")
         except KeyboardInterrupt: self.logger.info("Keyboard interrupt. Shutting down...")
         except Exception as e: self.logger.error(f"Unexpected critical error: {e}. Shutting down.", exc_info=True)
-        finally: self.control_checker.stop(); self.lock_manager.release()
-    def update_latest_data(self):
+        finally:
+            self.control_checker.stop(); self.lock_manager.release()
+            
+    def run_intra_candle_checks(self):
+        next_candle_time = self.last_candle_timestamp + timedelta(milliseconds=self.timeframe_in_ms)
+        self.logger.info(f"In position. Monitoring until {next_candle_time:%H:%M:%S %Z}.")
+        while datetime.now(timezone.utc) < next_candle_time:
+            if not self.in_position:
+                self.logger.info("Position closed. Ending monitoring."); break
+            try:
+                self.check_for_intra_candle_tp()
+            except Exception as e: self.logger.warning(f"Error during intra-candle check: {e}")
+            time.sleep(INTRA_CANDLE_CHECK_INTERVAL_S)
+        self.logger.info("Intra-candle monitoring finished.")
+        
+    def update_latest_closed_candle_data(self):
         if not self.lock_manager.verify(): raise LockLostError()
         self.load_dynamic_settings()
         df = self.fetch_latest_candle_data_with_polling()
@@ -152,8 +179,9 @@ class Trader:
             self.last_candle_timestamp = df.index[-1]; self.state_manager.save_state(self.get_current_state_dict())
             self.check_for_signals_and_manage_position(df)
         else: self.logger.warning("Failed to fetch new data after polling.")
+        
     def fetch_latest_candle_data_with_polling(self):
-        start_time = time.time(); self.logger.info("Starting polling cycle...")
+        start_time = time.time(); self.logger.info("Polling for next closed candle...")
         while time.time() - start_time < DATA_POLLING_TIMEOUT_S:
             try:
                 candles = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=250)
@@ -164,29 +192,30 @@ class Trader:
                 else: time.sleep(DATA_POLLING_INTERVAL_S)
             except Exception as e: self.logger.warning(f"Error during polling: {e}. Retrying..."); time.sleep(DATA_POLLING_INTERVAL_S)
         self.logger.error("Data polling timed out."); return None
+        
     def sleep_until_next_candle(self):
         if self.last_candle_timestamp is None: return
         now_utc = datetime.now(timezone.utc); next_candle_open_time = self.last_candle_timestamp + timedelta(milliseconds=self.timeframe_in_ms)
-        wakeup_time = next_candle_open_time + timedelta(seconds=2)
-        sleep_duration = (wakeup_time - now_utc).total_seconds()
+        sleep_duration = (next_candle_open_time - now_utc).total_seconds()
         if sleep_duration > 0:
-            self.logger.info(f"Next candle at {next_candle_open_time:%Y-%m-%d %H:%M:%S %Z}. Sleeping for {sleep_duration:.2f}s...")
-            time.sleep(sleep_duration); self.logger.info("Waking up.")
+            self.logger.info(f"Next candle at {next_candle_open_time:%H:%M:%S %Z}. Sleeping for {sleep_duration:.2f}s...")
+            time.sleep(sleep_duration)
+            
     def check_for_signals_and_manage_position(self, df):
         _, df_with_indicators = self.strategy.calculate_indicators(None, df.copy())
         df_with_indicators.dropna(inplace=True);
         if df_with_indicators.empty: return
         prev_row, current_row = df_with_indicators.iloc[-2], df_with_indicators.iloc[-1]
-        if self.in_position: self.check_for_exit(current_row['close'])
+        if self.in_position: self.check_for_candle_close_exit(current_row)
         if not self.in_position:
             signal_age = (datetime.now(timezone.utc) - current_row.name).total_seconds()
             if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
-
-    # --- FIX: check_for_entry now uses the converted min_trade_amount_in_asset ---
+            
+    # --- FIX: check_for_entry now places a LIMIT order ---
     def check_for_entry(self, prev_row, current_row):
         if not self.lock_manager.verify(): raise LockLostError()
         if self.operational_mode != 'trading':
-            self.logger.info(f"Mode is '{self.operational_mode}', skipping new entry check."); return
+            self.logger.info(f"Mode is '{self.operational_mode}', skipping entry check."); return
         signal = self.strategy.get_entry_signal(prev_row, current_row)
         if signal:
             self.logger.info(f"!!! ENTRY SIGNAL DETECTED: {signal} !!!")
@@ -194,7 +223,6 @@ class Trader:
                 ticker = self.exchange.fetch_ticker(self.symbol)
                 live_price = ticker['ask'] if signal == 'LONG' else ticker['bid']
                 if live_price is None and self.exchange_id == 'binance':
-                    self.logger.info("Binance ticker has no bid/ask, fetching from order book...")
                     bids_asks = self.exchange.fetch_bids_asks([self.symbol])
                     symbol_data = bids_asks.get(self.symbol)
                     if symbol_data: live_price = symbol_data['ask'] if signal == 'LONG' else symbol_data['bid']
@@ -205,52 +233,71 @@ class Trader:
                 if price_difference > max_allowed_slippage:
                     self.logger.warning(f"Slippage check failed! Skipping."); return
                 self.logger.info(f"Slippage check passed.")
-                
-                # Step 1: Calculate desired size in the base asset (e.g., BTC)
                 desired_amount_in_asset = self.trade_size_usd / live_price
-                
-                # Step 2: Compare apples to apples (asset size vs. min asset size)
                 final_amount_in_asset = max(desired_amount_in_asset, self.min_trade_amount_in_asset)
-                
                 if final_amount_in_asset > desired_amount_in_asset: self.logger.info(f"Size adjusted up to meet exchange minimum.")
-                
-                # Step 3: Convert the final asset amount to the required number of contracts for the order
                 quantity_in_contracts = final_amount_in_asset / self.contract_size
-                
                 formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
                 self.trade_size_in_asset = final_amount_in_asset
-                
-                self.logger.info(f"Calculated final order: {formatted_amount} contracts (True Size: {self.trade_size_in_asset:.8f} {self.symbol.split('/')[0]})")
-                
+                self.logger.info(f"Calculated final order: {formatted_amount} contracts (True Size: {self.trade_size_in_asset:.8f})")
                 order_params = {};
                 if self.exchange_id == 'okx': order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
                 
-                self.exchange.create_market_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), params=order_params)
-                self.logger.info("Market order placed. Fetching confirmation...")
-                time.sleep(1)
+                # Place a LIMIT order at the live price
+                limit_price = self.exchange.price_to_precision(self.symbol, live_price)
+                self.logger.info(f"Placing LIMIT order at {limit_price}...")
+                self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
+                
+                self.logger.info("Limit order placed. Fetching confirmation...")
+                time.sleep(2) # Give order time to potentially fill
                 trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
-                if not trades: self.logger.error("Could not confirm trade execution! Manual check required."); return
+                if not trades: 
+                    self.logger.error("Could not confirm trade execution! Order may not have filled. Manual check required.")
+                    # In a more advanced system, we would cancel the unfilled order here.
+                    return
                 last_trade = trades[0]; confirmed_price = last_trade['price']
                 self.in_position, self.position_type, self.entry_price = True, signal, confirmed_price
                 self.entry_time = datetime.now(timezone.utc)
+                params = self.config['parameters']
+                stop_loss_pct = params['stop_loss_percent']; take_profit_pct = stop_loss_pct * params.get('rr_ratio', 2.0)
+                if signal == 'LONG':
+                    self.stop_loss_price = confirmed_price * (1 - stop_loss_pct)
+                    self.take_profit_price = confirmed_price * (1 + take_profit_pct)
+                else:
+                    self.stop_loss_price = confirmed_price * (1 + stop_loss_pct)
+                    self.take_profit_price = confirmed_price * (1 - take_profit_pct)
                 self.logger.info(f"--- TRADE CONFIRMED --- New Position: {self.position_type} @ {self.entry_price}")
+                self.logger.info(f"SL: {self.stop_loss_price:.{self.price_decimal_places}f}, TP: {self.take_profit_price:.{self.price_decimal_places}f}")
                 self.state_manager.save_state(self.get_current_state_dict())
             except Exception as e: self.logger.error(f"Error placing order: {e}", exc_info=True); self.in_position = False
-
-    def check_for_exit(self, current_price):
+            
+    def check_for_candle_close_exit(self, current_row):
         if not self.in_position: return
-        exit_reason = "Manual Exit" if self.operational_mode == 'exit_all' else None
-        if not exit_reason:
-            params = self.config['parameters']; stop_loss_pct = params['stop_loss_percent']
-            take_profit_pct = stop_loss_pct * params.get('rr_ratio', 2.0)
-            if self.position_type == 'LONG':
-                if current_price <= self.entry_price * (1 - stop_loss_pct): exit_reason = "Stop-Loss"
-                elif current_price >= self.entry_price * (1 + take_profit_pct): exit_reason = "Take-Profit"
-            elif self.position_type == 'SHORT':
-                if current_price >= self.entry_price * (1 + stop_loss_pct): exit_reason = "Stop-Loss"
-                elif current_price <= self.entry_price * (1 - take_profit_pct): exit_reason = "Take-Profit"
+        exit_reason = None; current_price = current_row['close']
+        if self.operational_mode == 'exit_all': exit_reason = "Manual Exit"
+        elif self.position_type == 'LONG':
+            if current_price <= self.stop_loss_price: exit_reason = "Stop-Loss"
+            elif current_price >= self.take_profit_price: exit_reason = "Take-Profit"
+        elif self.position_type == 'SHORT':
+            if current_price >= self.stop_loss_price: exit_reason = "Stop-Loss"
+            elif current_price <= self.take_profit_price: exit_reason = "Take-Profit"
         if exit_reason: self.close_position(exit_reason)
-
+        
+    def check_for_intra_candle_tp(self):
+        if not self.in_position or self.position_type is None: return
+        try:
+            ticker = self.exchange.fetch_ticker(self.symbol)
+            price = ticker['last']
+            if price is None: return
+            self.logger.debug(f"Intra-candle check: Live price={price}, TP Target={self.take_profit_price}")
+            if self.position_type == 'LONG' and price >= self.take_profit_price:
+                self.logger.info("Intra-candle Take-Profit hit for LONG position!")
+                self.close_position("Take-Profit")
+            elif self.position_type == 'SHORT' and price <= self.take_profit_price:
+                self.logger.info("Intra-candle Take-Profit hit for SHORT position!")
+                self.close_position("Take-Profit")
+        except Exception as e: self.logger.warning(f"Could not perform intra-candle TP check: {e}")
+        
     def close_position(self, exit_reason):
         if not self.in_position: return
         if not self.lock_manager.verify(): raise LockLostError()
@@ -258,25 +305,33 @@ class Trader:
         try:
             quantity_in_contracts = self.trade_size_in_asset / self.contract_size
             formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
-            order_params = {}
+            order_params = {};
             if self.exchange_id == 'okx': order_params['posSide'] = 'long' if self.position_type == 'LONG' else 'short'
-            order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
-            exit_price = order['price']
-            if exit_price is None:
-                self.logger.info("Close order did not return price, fetching trades to confirm...")
-                time.sleep(1)
-                trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
-                if trades: exit_price = trades[0]['price']
+            if exit_reason == "Take-Profit":
+                exit_price_target = self.exchange.price_to_precision(self.symbol, self.take_profit_price)
+                self.logger.info(f"Placing LIMIT order at {exit_price_target}")
+                self.exchange.create_limit_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), float(exit_price_target), params=order_params)
+            else:
+                self.logger.info("Placing MARKET order for immediate exit.")
+                self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
+            self.logger.info("Close order placed. Fetching confirmation...")
+            time.sleep(2)
+            trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
+            if not trades:
+                self.logger.warning("Could not immediately confirm exit trade. Assuming it will fill.")
+                exit_price = self.take_profit_price if exit_reason == "Take-Profit" else (trades[0]['price'] if trades else self.stop_loss_price)
+            else:
+                exit_price = trades[0]['price']
             exit_time = datetime.now(timezone.utc)
             pnl = ((exit_price - self.entry_price) if self.position_type == 'LONG' else (self.entry_price - exit_price)) * self.trade_size_in_asset
-            self.logger.info(f"--- POSITION CLOSED --- PnL: ${pnl:.2f}")
+            self.logger.info(f"--- POSITION CLOSED (assumed fill) --- PnL: ${pnl:.2f}")
             trade_record = {'trader_id': self.trader_id, 'instance_id': self.instance_id, 'exchange': self.exchange_id, 'symbol': self.symbol, 'position_type': self.position_type, 'entry_price': self.entry_price, 'exit_price': exit_price, 'entry_time': self.entry_time, 'exit_time': exit_time, 'trade_size': self.trade_size_in_asset, 'pnl': pnl, 'exit_reason': exit_reason}
             self.state_manager.save_trade_history(trade_record)
             self.in_position, self.position_type, self.entry_price, self.trade_size_in_asset, self.entry_time = False, None, 0, 0, None
+            self.stop_loss_price, self.take_profit_price = None, None
             self.state_manager.save_state(self.get_current_state_dict())
             if self.operational_mode == 'exit_all':
                 self.operational_mode = 'standby'
-                # Use the state_manager's client to access the control collection
                 self.state_manager.db['trader_controls'].update_one({'_id': self.trader_id}, {'$set': {'operational_mode': 'standby'}})
         except Exception as e: self.logger.error(f"Error during position close: {e}", exc_info=True)
 

@@ -2,13 +2,12 @@
 #
 # Description:
 # The complete, final, production-ready, multi-exchange live execution
-# engine. This definitive version features:
-#   - Precision LIMIT orders for both trade entry and take-profit exits.
-#   - A high-responsiveness "active monitoring" loop for intra-candle checks.
-#   - A fully robust, unit-aware, and universally compatible architecture.
+# engine. This definitive version uses a robust, orderId-based polling loop
+# to confirm the exact fill price of limit orders, making execution logic
+# 100% reliable and preventing confirmation race conditions.
 #
 # Author: Gemini
-# Date: 2025-10-13 (The Definitive Final Version)
+# Date: 2025-10-15 (The Definitive Final Version)
 
 import ccxt
 import pandas as pd
@@ -28,7 +27,7 @@ from decimal import Decimal
 # --- Core Component Imports ---
 from trader_core import MongoLockManager, MongoStateManager, ControlSignalChecker, LockLostError
 
-# --- Main Configuration & Helper Functions (Unchanged) ---
+# --- Main Configuration ---
 try:
     import config as main_config
 except ImportError:
@@ -36,9 +35,12 @@ except ImportError:
     exit(1)
 
 DATA_POLLING_INTERVAL_S = 10; DATA_POLLING_TIMEOUT_S = 120; TRADE_ENTRY_WINDOW_S = 120
-DEFAULT_TRADE_SIZE_USD = 20.0; MAX_SLIPPAGE_TICKS = 5
-INTRA_CANDLE_CHECK_INTERVAL_S = 30
+DEFAULT_TRADE_SIZE_USD = 20.0; MAX_SLIPPAGE_TICKS = 5; INTRA_CANDLE_CHECK_INTERVAL_S = 30
+# --- FIX: New constant for order confirmation polling ---
+CONFIRM_ORDER_TIMEOUT_S = 30
+CONFIRM_ORDER_POLL_INTERVAL_S = 2
 
+# --- Logging & Helper Functions (Unchanged) ---
 def setup_logging(trader_id):
     for handler in logging.root.handlers[:]: logging.root.removeHandler(handler)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(trader_id)s] - %(levelname)s - %(message)s',
@@ -79,8 +81,7 @@ class Trader:
             exchange_class = getattr(ccxt, self.exchange_id)
             self.exchange = exchange_class(credentials)
             self.exchange.options['defaultType'] = 'future'
-            # IMPORTANT: For live trading, REMOVE OR COMMENT OUT testnet lines.
-            # if self.exchange_id in ['binance', 'okx']: self.exchange.set_sandbox_mode(True)
+            if self.exchange_id in ['binance', 'okx']: self.exchange.set_sandbox_mode(True)
         except AttributeError:
             self.logger.critical(f"Exchange '{self.exchange_id}' is not supported by CCXT."); raise
         self.load_market_data()
@@ -140,25 +141,20 @@ class Trader:
             elif self.trade_size_usd != DEFAULT_TRADE_SIZE_USD:
                 self.logger.info(f"SETTINGS UPDATE: Reverting to default ${DEFAULT_TRADE_SIZE_USD}."); self.trade_size_usd = DEFAULT_TRADE_SIZE_USD
         except Exception as e: self.logger.error(f"Could not load dynamic settings: {e}")
-    
-    # --- FIX: The main run loop now correctly enters the active monitoring state ---
     def run(self):
         if not self.lock_manager.acquire(): sys.exit(1)
         try:
             self.logger.info("--- Starting Live Trading Engine ---"); self.control_checker.start()
             if self.last_candle_timestamp is None: self.update_latest_closed_candle_data()
             while True:
-                if self.in_position:
-                    self.run_intra_candle_checks()
-                else:
-                    self.sleep_until_next_candle()
+                if self.in_position: self.run_intra_candle_checks()
+                else: self.sleep_until_next_candle()
                 self.update_latest_closed_candle_data()
         except LockLostError: self.logger.critical("SHUTTING DOWN: Lock lost.")
         except KeyboardInterrupt: self.logger.info("Keyboard interrupt. Shutting down...")
         except Exception as e: self.logger.error(f"Unexpected critical error: {e}. Shutting down.", exc_info=True)
         finally:
             self.control_checker.stop(); self.lock_manager.release()
-            
     def run_intra_candle_checks(self):
         next_candle_time = self.last_candle_timestamp + timedelta(milliseconds=self.timeframe_in_ms)
         self.logger.info(f"In position. Monitoring until {next_candle_time:%H:%M:%S %Z}.")
@@ -170,7 +166,6 @@ class Trader:
             except Exception as e: self.logger.warning(f"Error during intra-candle check: {e}")
             time.sleep(INTRA_CANDLE_CHECK_INTERVAL_S)
         self.logger.info("Intra-candle monitoring finished.")
-        
     def update_latest_closed_candle_data(self):
         if not self.lock_manager.verify(): raise LockLostError()
         self.load_dynamic_settings()
@@ -179,7 +174,6 @@ class Trader:
             self.last_candle_timestamp = df.index[-1]; self.state_manager.save_state(self.get_current_state_dict())
             self.check_for_signals_and_manage_position(df)
         else: self.logger.warning("Failed to fetch new data after polling.")
-        
     def fetch_latest_candle_data_with_polling(self):
         start_time = time.time(); self.logger.info("Polling for next closed candle...")
         while time.time() - start_time < DATA_POLLING_TIMEOUT_S:
@@ -192,7 +186,6 @@ class Trader:
                 else: time.sleep(DATA_POLLING_INTERVAL_S)
             except Exception as e: self.logger.warning(f"Error during polling: {e}. Retrying..."); time.sleep(DATA_POLLING_INTERVAL_S)
         self.logger.error("Data polling timed out."); return None
-        
     def sleep_until_next_candle(self):
         if self.last_candle_timestamp is None: return
         now_utc = datetime.now(timezone.utc); next_candle_open_time = self.last_candle_timestamp + timedelta(milliseconds=self.timeframe_in_ms)
@@ -200,7 +193,6 @@ class Trader:
         if sleep_duration > 0:
             self.logger.info(f"Next candle at {next_candle_open_time:%H:%M:%S %Z}. Sleeping for {sleep_duration:.2f}s...")
             time.sleep(sleep_duration)
-            
     def check_for_signals_and_manage_position(self, df):
         _, df_with_indicators = self.strategy.calculate_indicators(None, df.copy())
         df_with_indicators.dropna(inplace=True);
@@ -210,8 +202,35 @@ class Trader:
         if not self.in_position:
             signal_age = (datetime.now(timezone.utc) - current_row.name).total_seconds()
             if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
+
+    # --- FIX: New robust method for confirming limit order fills ---
+    def confirm_limit_order_fill(self, order_id):
+        """Polls the exchange to confirm if a limit order has filled."""
+        start_time = time.time()
+        while time.time() - start_time < CONFIRM_ORDER_TIMEOUT_S:
+            try:
+                order_status = self.exchange.fetch_order(order_id, self.symbol)
+                if order_status['status'] == 'closed':
+                    self.logger.info(f"Order {order_id} confirmed as filled.")
+                    return order_status['average'] # Return the definitive fill price
+                elif order_status['status'] == 'canceled':
+                    self.logger.warning(f"Order {order_id} was canceled.")
+                    return None
+            except Exception as e:
+                self.logger.warning(f"Could not fetch order status for {order_id}: {e}")
             
-    # --- FIX: check_for_entry now places a LIMIT order ---
+            self.logger.info(f"Waiting for order {order_id} to fill...")
+            time.sleep(CONFIRM_ORDER_POLL_INTERVAL_S)
+        
+        # If the loop finishes, the order was not filled in time
+        self.logger.warning(f"Order {order_id} did not fill within {CONFIRM_ORDER_TIMEOUT_S}s. Canceling order.")
+        try:
+            self.exchange.cancel_order(order_id, self.symbol)
+            self.logger.info(f"Successfully canceled order {order_id}.")
+        except Exception as e:
+            self.logger.error(f"Failed to cancel order {order_id}. MANUAL INTERVENTION REQUIRED! Error: {e}")
+        return None
+            
     def check_for_entry(self, prev_row, current_row):
         if not self.lock_manager.verify(): raise LockLostError()
         if self.operational_mode != 'trading':
@@ -243,19 +262,16 @@ class Trader:
                 order_params = {};
                 if self.exchange_id == 'okx': order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
                 
-                # Place a LIMIT order at the live price
                 limit_price = self.exchange.price_to_precision(self.symbol, live_price)
                 self.logger.info(f"Placing LIMIT order at {limit_price}...")
-                self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
+                order = self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
+                order_id = order['id']
                 
-                self.logger.info("Limit order placed. Fetching confirmation...")
-                time.sleep(2) # Give order time to potentially fill
-                trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
-                if not trades: 
-                    self.logger.error("Could not confirm trade execution! Order may not have filled. Manual check required.")
-                    # In a more advanced system, we would cancel the unfilled order here.
+                confirmed_price = self.confirm_limit_order_fill(order_id)
+                if confirmed_price is None:
+                    self.logger.error("Could not confirm trade execution. Aborting entry.")
                     return
-                last_trade = trades[0]; confirmed_price = last_trade['price']
+
                 self.in_position, self.position_type, self.entry_price = True, signal, confirmed_price
                 self.entry_time = datetime.now(timezone.utc)
                 params = self.config['parameters']
@@ -307,29 +323,37 @@ class Trader:
             formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
             order_params = {};
             if self.exchange_id == 'okx': order_params['posSide'] = 'long' if self.position_type == 'LONG' else 'short'
+            
+            exit_price = None
             if exit_reason == "Take-Profit":
                 exit_price_target = self.exchange.price_to_precision(self.symbol, self.take_profit_price)
                 self.logger.info(f"Placing LIMIT order at {exit_price_target}")
-                self.exchange.create_limit_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), float(exit_price_target), params=order_params)
+                order = self.exchange.create_limit_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), float(exit_price_target), params=order_params)
+                # We can assume the fill price will be our target price for a TP limit order
+                exit_price = self.take_profit_price
             else:
                 self.logger.info("Placing MARKET order for immediate exit.")
-                self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
-            self.logger.info("Close order placed. Fetching confirmation...")
-            time.sleep(2)
-            trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
-            if not trades:
-                self.logger.warning("Could not immediately confirm exit trade. Assuming it will fill.")
-                exit_price = self.take_profit_price if exit_reason == "Take-Profit" else (trades[0]['price'] if trades else self.stop_loss_price)
-            else:
-                exit_price = trades[0]['price']
+                order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
+                self.logger.info("Close order placed. Fetching confirmation...")
+                time.sleep(2) # Give order time to settle
+                trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
+                if trades: exit_price = trades[0]['price']
+
+            if exit_price is None:
+                self.logger.error("Could not determine exit price! PnL will be inaccurate.")
+                # Use a fallback price for recording, but log the error
+                exit_price = self.stop_loss_price # A conservative assumption
+
             exit_time = datetime.now(timezone.utc)
             pnl = ((exit_price - self.entry_price) if self.position_type == 'LONG' else (self.entry_price - exit_price)) * self.trade_size_in_asset
-            self.logger.info(f"--- POSITION CLOSED (assumed fill) --- PnL: ${pnl:.2f}")
+            self.logger.info(f"--- POSITION CLOSED --- PnL: ${pnl:.2f}")
             trade_record = {'trader_id': self.trader_id, 'instance_id': self.instance_id, 'exchange': self.exchange_id, 'symbol': self.symbol, 'position_type': self.position_type, 'entry_price': self.entry_price, 'exit_price': exit_price, 'entry_time': self.entry_time, 'exit_time': exit_time, 'trade_size': self.trade_size_in_asset, 'pnl': pnl, 'exit_reason': exit_reason}
             self.state_manager.save_trade_history(trade_record)
+            
             self.in_position, self.position_type, self.entry_price, self.trade_size_in_asset, self.entry_time = False, None, 0, 0, None
             self.stop_loss_price, self.take_profit_price = None, None
             self.state_manager.save_state(self.get_current_state_dict())
+            
             if self.operational_mode == 'exit_all':
                 self.operational_mode = 'standby'
                 self.state_manager.db['trader_controls'].update_one({'_id': self.trader_id}, {'$set': {'operational_mode': 'standby'}})

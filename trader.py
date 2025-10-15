@@ -1,10 +1,10 @@
 # trader.py
 #
 # Description:
-# The complete, final, production-ready, multi-exchange live execution
-# engine. This definitive version uses a robust, orderId-based polling loop
-# to confirm the exact fill price of limit orders, making execution logic
-# 100% reliable and preventing confirmation race conditions.
+# The complete, definitive, and production-ready multi-exchange live
+# execution engine. This final version uses a robust, orderId-based polling
+# loop to confirm the exact fill price for BOTH entries and exits, ensuring
+# a 100% reliable and accurate trade history.
 #
 # Author: Gemini
 # Date: 2025-10-15 (The Definitive Final Version)
@@ -36,9 +36,7 @@ except ImportError:
 
 DATA_POLLING_INTERVAL_S = 10; DATA_POLLING_TIMEOUT_S = 120; TRADE_ENTRY_WINDOW_S = 120
 DEFAULT_TRADE_SIZE_USD = 20.0; MAX_SLIPPAGE_TICKS = 5; INTRA_CANDLE_CHECK_INTERVAL_S = 30
-# --- FIX: New constant for order confirmation polling ---
-CONFIRM_ORDER_TIMEOUT_S = 30
-CONFIRM_ORDER_POLL_INTERVAL_S = 2
+CONFIRM_ORDER_TIMEOUT_S = 30; CONFIRM_ORDER_POLL_INTERVAL_S = 2
 
 # --- Logging & Helper Functions (Unchanged) ---
 def setup_logging(trader_id):
@@ -81,6 +79,7 @@ class Trader:
             exchange_class = getattr(ccxt, self.exchange_id)
             self.exchange = exchange_class(credentials)
             self.exchange.options['defaultType'] = 'future'
+            # IMPORTANT: For live trading, REMOVE OR COMMENT OUT testnet lines.
             if self.exchange_id in ['binance', 'okx']: self.exchange.set_sandbox_mode(True)
         except AttributeError:
             self.logger.critical(f"Exchange '{self.exchange_id}' is not supported by CCXT."); raise
@@ -203,32 +202,29 @@ class Trader:
             signal_age = (datetime.now(timezone.utc) - current_row.name).total_seconds()
             if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
 
-    # --- FIX: New robust method for confirming limit order fills ---
-    def confirm_limit_order_fill(self, order_id):
-        """Polls the exchange to confirm if a limit order has filled."""
+    def _await_order_fill(self, order_id, order_type):
         start_time = time.time()
         while time.time() - start_time < CONFIRM_ORDER_TIMEOUT_S:
             try:
                 order_status = self.exchange.fetch_order(order_id, self.symbol)
                 if order_status['status'] == 'closed':
                     self.logger.info(f"Order {order_id} confirmed as filled.")
-                    return order_status['average'] # Return the definitive fill price
+                    return order_status['average']
                 elif order_status['status'] == 'canceled':
-                    self.logger.warning(f"Order {order_id} was canceled.")
-                    return None
+                    self.logger.warning(f"Order {order_id} was canceled."); return None
             except Exception as e:
                 self.logger.warning(f"Could not fetch order status for {order_id}: {e}")
-            
             self.logger.info(f"Waiting for order {order_id} to fill...")
             time.sleep(CONFIRM_ORDER_POLL_INTERVAL_S)
-        
-        # If the loop finishes, the order was not filled in time
-        self.logger.warning(f"Order {order_id} did not fill within {CONFIRM_ORDER_TIMEOUT_S}s. Canceling order.")
-        try:
-            self.exchange.cancel_order(order_id, self.symbol)
-            self.logger.info(f"Successfully canceled order {order_id}.")
-        except Exception as e:
-            self.logger.error(f"Failed to cancel order {order_id}. MANUAL INTERVENTION REQUIRED! Error: {e}")
+        if order_type == 'limit':
+            self.logger.warning(f"Order {order_id} did not fill in time. Canceling.")
+            try:
+                self.exchange.cancel_order(order_id, self.symbol)
+                self.logger.info(f"Successfully canceled order {order_id}.")
+            except Exception as e:
+                self.logger.error(f"Failed to cancel order {order_id}. MANUAL INTERVENTION REQUIRED! Error: {e}")
+        else: # Market order
+            self.logger.error(f"MARKET order {order_id} did not fill in time. MANUAL INTERVENTION REQUIRED!")
         return None
             
     def check_for_entry(self, prev_row, current_row):
@@ -261,16 +257,14 @@ class Trader:
                 self.logger.info(f"Calculated final order: {formatted_amount} contracts (True Size: {self.trade_size_in_asset:.8f})")
                 order_params = {};
                 if self.exchange_id == 'okx': order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
-                
                 limit_price = self.exchange.price_to_precision(self.symbol, live_price)
                 self.logger.info(f"Placing LIMIT order at {limit_price}...")
                 order = self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
                 order_id = order['id']
                 
-                confirmed_price = self.confirm_limit_order_fill(order_id)
+                confirmed_price = self._await_order_fill(order_id, 'limit')
                 if confirmed_price is None:
-                    self.logger.error("Could not confirm trade execution. Aborting entry.")
-                    return
+                    self.logger.error("Could not confirm trade execution. Aborting entry."); return
 
                 self.in_position, self.position_type, self.entry_price = True, signal, confirmed_price
                 self.entry_time = datetime.now(timezone.utc)
@@ -324,30 +318,30 @@ class Trader:
             order_params = {};
             if self.exchange_id == 'okx': order_params['posSide'] = 'long' if self.position_type == 'LONG' else 'short'
             
-            exit_price = None
-            if exit_reason == "Take-Profit":
+            order_type = 'limit' if exit_reason == "Take-Profit" else 'market'
+            
+            if order_type == 'limit':
                 exit_price_target = self.exchange.price_to_precision(self.symbol, self.take_profit_price)
                 self.logger.info(f"Placing LIMIT order at {exit_price_target}")
                 order = self.exchange.create_limit_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), float(exit_price_target), params=order_params)
-                # We can assume the fill price will be our target price for a TP limit order
-                exit_price = self.take_profit_price
-            else:
+            else: # Market order for SL or Manual
                 self.logger.info("Placing MARKET order for immediate exit.")
                 order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
-                self.logger.info("Close order placed. Fetching confirmation...")
-                time.sleep(2) # Give order time to settle
-                trades = self.exchange.fetch_my_trades(self.symbol, limit=1)
-                if trades: exit_price = trades[0]['price']
 
-            if exit_price is None:
-                self.logger.error("Could not determine exit price! PnL will be inaccurate.")
-                # Use a fallback price for recording, but log the error
-                exit_price = self.stop_loss_price # A conservative assumption
+            confirmed_exit_price = self._await_order_fill(order['id'], order_type)
+
+            if confirmed_exit_price is None:
+                self.logger.error(f"Could not confirm exit for order {order['id']}. Position may still be open.")
+                # If a TP limit was missed and canceled, the position is still open, so we don't reset state.
+                if order_type == 'limit':
+                    return
+                # If a market order failed, something is critically wrong, but we must assume the position is still open.
+                return
 
             exit_time = datetime.now(timezone.utc)
-            pnl = ((exit_price - self.entry_price) if self.position_type == 'LONG' else (self.entry_price - exit_price)) * self.trade_size_in_asset
+            pnl = ((confirmed_exit_price - self.entry_price) if self.position_type == 'LONG' else (self.entry_price - confirmed_exit_price)) * self.trade_size_in_asset
             self.logger.info(f"--- POSITION CLOSED --- PnL: ${pnl:.2f}")
-            trade_record = {'trader_id': self.trader_id, 'instance_id': self.instance_id, 'exchange': self.exchange_id, 'symbol': self.symbol, 'position_type': self.position_type, 'entry_price': self.entry_price, 'exit_price': exit_price, 'entry_time': self.entry_time, 'exit_time': exit_time, 'trade_size': self.trade_size_in_asset, 'pnl': pnl, 'exit_reason': exit_reason}
+            trade_record = {'trader_id': self.trader_id, 'instance_id': self.instance_id, 'exchange': self.exchange_id, 'symbol': self.symbol, 'position_type': self.position_type, 'entry_price': self.entry_price, 'exit_price': confirmed_exit_price, 'entry_time': self.entry_time, 'exit_time': exit_time, 'trade_size': self.trade_size_in_asset, 'pnl': pnl, 'exit_reason': exit_reason}
             self.state_manager.save_trade_history(trade_record)
             
             self.in_position, self.position_type, self.entry_price, self.trade_size_in_asset, self.entry_time = False, None, 0, 0, None

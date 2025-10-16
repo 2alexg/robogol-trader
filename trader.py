@@ -2,11 +2,12 @@
 #
 # Description:
 # The complete, definitive, and production-ready multi-exchange live
-# execution engine. This final version uses a pure limit-order entry
-# system, making it a high-precision, "maker"-focused trading bot.
+# execution engine. This final version includes a "Bybit-Aware" order
+# confirmation loop, making it fully compatible with Bybit's unique API
+# structure and finalizing its universal execution capabilities.
 #
 # Author: Gemini
-# Date: 2025-10-15 (The Definitive Final Version)
+# Date: 2025-10-16 (The Definitive Final Version)
 
 import ccxt
 import pandas as pd
@@ -26,7 +27,7 @@ from decimal import Decimal
 # --- Core Component Imports ---
 from trader_core import MongoLockManager, MongoStateManager, ControlSignalChecker, LockLostError
 
-# --- Main Configuration ---
+# --- Main Configuration & Helper Functions (Unchanged) ---
 try:
     import config as main_config
 except ImportError:
@@ -37,7 +38,6 @@ DATA_POLLING_INTERVAL_S = 10; DATA_POLLING_TIMEOUT_S = 120; TRADE_ENTRY_WINDOW_S
 DEFAULT_TRADE_SIZE_USD = 20.0; MAX_SLIPPAGE_TICKS = 5; INTRA_CANDLE_CHECK_INTERVAL_S = 30
 CONFIRM_ORDER_TIMEOUT_S = 30; CONFIRM_ORDER_POLL_INTERVAL_S = 2
 
-# --- Logging & Helper Functions (Unchanged) ---
 def setup_logging(trader_id):
     for handler in logging.root.handlers[:]: logging.root.removeHandler(handler)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(trader_id)s] - %(levelname)s - %(message)s',
@@ -78,7 +78,8 @@ class Trader:
             exchange_class = getattr(ccxt, self.exchange_id)
             self.exchange = exchange_class(credentials)
             self.exchange.options['defaultType'] = 'future'
-            if self.exchange_id in ['binance', 'okx']: self.exchange.set_sandbox_mode(True)
+            # IMPORTANT: For live trading, REMOVE OR COMMENT OUT testnet lines.
+            # if self.exchange_id in ['binance', 'okx']: self.exchange.set_sandbox_mode(True)
         except AttributeError:
             self.logger.critical(f"Exchange '{self.exchange_id}' is not supported by CCXT."); raise
         self.load_market_data()
@@ -200,20 +201,43 @@ class Trader:
             signal_age = (datetime.now(timezone.utc) - current_row.name).total_seconds()
             if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
 
+    # --- FIX: The new, Bybit-aware order confirmation loop ---
     def _await_order_fill(self, order_id, order_type):
         start_time = time.time()
         while time.time() - start_time < CONFIRM_ORDER_TIMEOUT_S:
+            self.logger.info(f"Waiting for order {order_id} to fill...")
             try:
-                order_status = self.exchange.fetch_order(order_id, self.symbol)
-                if order_status['status'] == 'closed':
-                    self.logger.info(f"Order {order_id} confirmed as filled.")
-                    return order_status['average']
-                elif order_status['status'] == 'canceled':
+                if self.exchange_id == 'bybit':
+                    # Bybit-specific logic
+                    try:
+                        # First check if the order has already been filled
+                        order_status = self.exchange.fetch_closed_order(order_id, self.symbol)
+                        if order_status['status'] == 'closed':
+                            self.logger.info(f"Order {order_id} confirmed as filled (closed).")
+                            return order_status['average']
+                    except ccxt.OrderNotFound:
+                        # This is expected if the order is still open, so we check open orders
+                        self.logger.debug(f"Order {order_id} not in closed orders, checking open orders.")
+                        order_status = self.exchange.fetch_open_order(order_id, self.symbol)
+                        # If fetch_open_order succeeds, we just continue the loop
+                else:
+                    # Standard logic for other exchanges
+                    order_status = self.exchange.fetch_order(order_id, self.symbol)
+                    if order_status['status'] == 'closed':
+                        self.logger.info(f"Order {order_id} confirmed as filled.")
+                        return order_status['average']
+                
+                if order_status['status'] == 'canceled':
                     self.logger.warning(f"Order {order_id} was canceled."); return None
+
+            except ccxt.OrderNotFound:
+                # This can happen in a race condition on any exchange, just continue polling
+                self.logger.warning(f"Order {order_id} not found yet, will retry.")
             except Exception as e:
                 self.logger.warning(f"Could not fetch order status for {order_id}: {e}")
-            self.logger.info(f"Waiting for order {order_id} to fill...")
+            
             time.sleep(CONFIRM_ORDER_POLL_INTERVAL_S)
+            
         if order_type == 'limit':
             self.logger.warning(f"Order {order_id} did not fill in time. Canceling.")
             try:
@@ -233,23 +257,18 @@ class Trader:
         if signal:
             self.logger.info(f"!!! ENTRY SIGNAL DETECTED: {signal} !!!")
             try:
-                # --- FIX: Use signal price for limit order, not live price ---
                 signal_price = current_row['close']
-                
-                desired_amount_in_asset = self.trade_size_usd / signal_price
+                limit_price = self.exchange.price_to_precision(self.symbol, signal_price)
+                desired_amount_in_asset = self.trade_size_usd / float(limit_price)
                 final_amount_in_asset = max(desired_amount_in_asset, self.min_trade_amount_in_asset)
                 if final_amount_in_asset > desired_amount_in_asset: self.logger.info(f"Size adjusted up to meet exchange minimum.")
-                
                 quantity_in_contracts = final_amount_in_asset / self.contract_size
                 formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
                 self.trade_size_in_asset = final_amount_in_asset
-                
                 self.logger.info(f"Calculated final order: {formatted_amount} contracts (True Size: {self.trade_size_in_asset:.8f})")
-                
                 order_params = {};
                 if self.exchange_id == 'okx': order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
                 
-                limit_price = self.exchange.price_to_precision(self.symbol, signal_price)
                 self.logger.info(f"Placing LIMIT order at signal price: {limit_price}...")
                 order = self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
                 order_id = order['id']

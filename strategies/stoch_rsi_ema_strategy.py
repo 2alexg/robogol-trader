@@ -1,100 +1,114 @@
 # strategies/stoch_rsi_ema_strategy.py
 #
 # Description:
-# A multi-timeframe strategy using a long-term EMA on a higher timeframe (HTF)
-# for trend direction and the Stochastic RSI on a lower timeframe (LTF) for
-# finding oversold/overbought entry points.
+# A multi-timeframe strategy that uses a high-timeframe EMA as a trend
+# filter and a low-timeframe Stochastic RSI for entry signals.
 #
 # Author: Gemini
-# Date: 2025-09-13 (v4 - Dynamic column name discovery)
+# Date: 2025-11-14
 
-import pandas as pd
-import pandas_ta as ta
 from .base_strategy import BaseStrategy
+import pandas_ta as ta
+import pandas as pd
 
 class StochRsiEmaStrategy(BaseStrategy):
     """
-    Implements the Stochastic RSI + EMA multi-timeframe strategy.
-    https://www.youtube.com/watch?v=UH9lp6_t86Y
+    A multi-timeframe strategy:
+    - High Timeframe: EMA (e.g., 200) for trend direction.
+    - Low Timeframe: Stochastic RSI for entry signals.
     """
-    is_multi_timeframe = True
-
     def __init__(self, params):
-        """
-        Initializes the strategy with its specific parameters.
-        """
         super().__init__(params)
-        self.ema_period = params['ema_period']
-        self.stoch_rsi_k = params['stoch_rsi_k']
-        self.stoch_rsi_d = params['stoch_rsi_d']
-        self.rsi_length = params['rsi_length']
-        self.oversold_threshold = params.get('oversold_threshold', 20)
-        self.overbought_threshold = params.get('overbought_threshold', 80)
-
-        # The name of the EMA column on the HTF dataframe
-        self.ema_col = f"EMA_{self.ema_period}"
-
-        # --- FIX: Initialize column names to None ---
-        # We will no longer predict the names. We will find them at runtime.
+        self.stoch_k = int(params.get('stoch_k', 14))
+        self.stoch_d = int(params.get('stoch_d', 3))
+        self.stoch_smooth_k = int(params.get('stoch_smooth_k', 3))
+        self.rsi_period = int(params.get('rsi_period', 14))
+        self.ema_period = int(params.get('ema_period', 200))
+        self.oversold_threshold = int(params.get('oversold', 20))
+        self.overbought_threshold = int(params.get('overbought', 80))
+        
         self.stoch_k_col = None
         self.stoch_d_col = None
+        self.ema_col = None
 
-    def calculate_indicators(self, df_htf, df_ltf):
-        """
-        Calculates the necessary indicators and aligns the two timeframes.
-        """
-        if df_htf is None or df_ltf is None:
-            return None, None
+    def calculate_indicators(self, high_tf_data, low_tf_data):
+        if high_tf_data is None:
+            # This strategy cannot function without high-timeframe data.
+            return None, None 
 
-        # 1. Calculate indicators on their respective timeframes
-        df_htf[self.ema_col] = ta.ema(df_htf['close'], length=self.ema_period)
+        # 1. Calculate High-Timeframe EMA
+        htf_df = high_tf_data.copy()
+        htf_df.ta.ema(length=self.ema_period, append=True)
+        self.ema_col = f"EMA_{self.ema_period}"
+        htf_df = htf_df[[self.ema_col]]
+
+        # 2. Calculate Low-Timeframe Stochastic RSI
+        ltf_df = low_tf_data.copy()
         
-        df_ltf.ta.stochrsi(k=self.stoch_rsi_k, d=self.stoch_rsi_d, rsi_length=self.rsi_length, append=True)
-
-        # --- FIX: Dynamically find the indicator column names ---
-        # This is a robust way to get the column names created by pandas-ta,
-        # regardless of its internal naming convention.
-        try:
-            self.stoch_k_col = next(col for col in df_ltf.columns if col.startswith('STOCHRSIk_'))
-            self.stoch_d_col = next(col for col in df_ltf.columns if col.startswith('STOCHRSId_'))
-        except StopIteration:
-            # This will happen if pandas-ta fails to create the columns.
-            # We raise an error to stop the backtest, as it cannot proceed.
-            raise ValueError("Could not find Stochastic RSI columns after calculation.")
-
-        # 2. Forward-fill the HTF data to align with the LTF
-        ltf_freq = self.params['ltf'].replace('m', 'min')
-        resampled_htf = df_htf.resample(ltf_freq).ffill()
-
-        # 3. Merge the aligned HTF data into the LTF dataframe
-        aligned_df = pd.merge(df_ltf, resampled_htf[[self.ema_col]], 
-                              left_index=True, right_index=True, how='left')
+        # This call modifies ltf_df in-place due to append=True
+        # and also returns a DataFrame with the StochRSI columns.
+        stoch_rsi = ltf_df.ta.stochrsi(
+            k=self.stoch_k,
+            d=self.stoch_d,
+            smooth_k=self.stoch_smooth_k,
+            rsi_length=self.rsi_period,
+            append=True
+        )
         
-        aligned_df[self.ema_col] = aligned_df[self.ema_col].ffill()
+        # Dynamically find the column names
+        # We can look in either `stoch_rsi` or `ltf_df` (since it was appended)
+        for col in stoch_rsi.columns:
+            if col.startswith('STOCHRSIk_'): self.stoch_k_col = col
+            if col.startswith('STOCHRSId_'): self.stoch_d_col = col
+
+        if not all([self.stoch_k_col, self.stoch_d_col]):
+            raise ValueError("Could not find StochRSI columns.")
+            
+        # --- FIX: This line is redundant and caused the crash ---
+        # ltf_df = ltf_df.join(stoch_rsi)
+        # --- End of Fix ---
         
-        return df_htf, aligned_df
+        # 3. Merge High-Timeframe data into Low-Timeframe
+        # Convert index to pandas datetime if not already
+        ltf_df.index = pd.to_datetime(ltf_df.index)
+        htf_df.index = pd.to_datetime(htf_df.index)
+
+        # Re-sample high-tf data to low-tf index, filling forward
+        merged_df = pd.merge_asof(
+            ltf_df,
+            htf_df,
+            left_index=True,
+            right_index=True,
+            direction='forward'
+        )
+        
+        return high_tf_data, merged_df
 
     def get_entry_signal(self, prev_row, current_row):
-        """
-        Determines the entry signal based on the strategy rules.
-        """
-        # --- LONG ENTRY CONDITIONS ---
-        price_above_ema = current_row['close'] > current_row[self.ema_col]
-        stoch_bullish_cross = (prev_row[self.stoch_k_col] <= prev_row[self.stoch_d_col] and
-                               current_row[self.stoch_k_col] > current_row[self.stoch_d_col])
-        in_oversold_area = current_row[self.stoch_k_col] < self.oversold_threshold
-
-        if price_above_ema and stoch_bullish_cross and in_oversold_area:
-            return 'LONG'
-
-        # --- SHORT ENTRY CONDITIONS ---
-        price_below_ema = current_row['close'] < current_row[self.ema_col]
-        stoch_bearish_cross = (prev_row[self.stoch_k_col] >= prev_row[self.stoch_d_col] and
-                               current_row[self.stoch_k_col] < current_row[self.stoch_d_col])
-        in_overbought_area = current_row[self.stoch_k_col] > self.overbought_threshold
+        # StochRSI Crossover Logic
+        stoch_k_cross_above_d = (
+            prev_row[self.stoch_k_col] < prev_row[self.stoch_d_col] and
+            current_row[self.stoch_k_col] > current_row[self.stoch_d_col]
+        )
+        stoch_k_cross_below_d = (
+            prev_row[self.stoch_k_col] > prev_row[self.stoch_d_col] and
+            current_row[self.stoch_k_col] < current_row[self.stoch_d_col]
+        )
         
-        if price_below_ema and stoch_bearish_cross and in_overbought_area:
+        # Trend Filter
+        price_above_ema = current_row['close'] > current_row[self.ema_col]
+        price_below_ema = current_row['close'] < current_row[self.ema_col]
+        
+        # Long Entry Signal
+        if (price_above_ema and 
+            stoch_k_cross_above_d and
+            current_row[self.stoch_k_col] < self.oversold_threshold):
+            return 'LONG'
+            
+        # Short Entry Signal
+        if (price_below_ema and
+            stoch_k_cross_below_d and
+            current_row[self.stoch_k_col] > self.overbought_threshold):
             return 'SHORT'
             
         return None
-

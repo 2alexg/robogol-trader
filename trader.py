@@ -2,12 +2,11 @@
 #
 # Description:
 # The complete, definitive, and production-ready multi-exchange live
-# execution engine. This final version includes a "Bybit-Aware" order
-# confirmation loop, making it fully compatible with Bybit's unique API
-# structure and finalizing its universal execution capabilities.
+# execution engine. This version is multi-timeframe-aware, allowing it
+# to run complex strategies like StochRsiEmaStrategy.
 #
 # Author: Gemini
-# Date: 2025-10-16 (The Definitive Final Version)
+# Date: 2025-11-14 (MTF-Aware Version)
 
 import ccxt
 import pandas as pd
@@ -27,7 +26,7 @@ from decimal import Decimal
 # --- Core Component Imports ---
 from trader_core import MongoLockManager, MongoStateManager, ControlSignalChecker, LockLostError
 
-# --- Main Configuration & Helper Functions (Unchanged) ---
+# --- Main Configuration ---
 try:
     import config as main_config
 except ImportError:
@@ -38,6 +37,7 @@ DATA_POLLING_INTERVAL_S = 10; DATA_POLLING_TIMEOUT_S = 120; TRADE_ENTRY_WINDOW_S
 DEFAULT_TRADE_SIZE_USD = 20.0; MAX_SLIPPAGE_TICKS = 5; INTRA_CANDLE_CHECK_INTERVAL_S = 30
 CONFIRM_ORDER_TIMEOUT_S = 30; CONFIRM_ORDER_POLL_INTERVAL_S = 2
 
+# --- Logging & Helper Functions (Unchanged) ---
 def setup_logging(trader_id):
     for handler in logging.root.handlers[:]: logging.root.removeHandler(handler)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(trader_id)s] - %(levelname)s - %(message)s',
@@ -55,16 +55,24 @@ def load_strategy_class(strategy_name):
         module_path = f"strategies.{module_name}"
         strategy_module = importlib.import_module(module_path)
         return getattr(strategy_module, strategy_name)
-    except (ImportError, AttributeError): return None
+    except (ImportError, AttributeError) as e: return None
 
 class Trader:
     def __init__(self, config, db_client, logger):
         self.config = config; self.symbol = config['symbol']; self.timeframe = config['timeframe']
         self.exchange_id = config['exchange'].lower()
         self.logger = logger
+        
+        # --- FIX: Check for multi-timeframe requirement ---
+        self.high_timeframe = config.get('high_timeframe')
+        self.high_tf_df = None # Will hold the high-timeframe data
+
         sanitized_symbol = re.sub(r'[^a-zA-Z0-9]', '', self.symbol)
         self.trader_id = f"{self.exchange_id}_{config['strategy_name']}_{sanitized_symbol}_{self.timeframe}"
         self.logger.info(f"Initializing trader with ID: {self.trader_id}")
+        if self.high_timeframe:
+            self.logger.info(f"Multi-timeframe strategy detected. High TF: {self.high_timeframe}")
+            
         self.instance_id = str(uuid.uuid4())
         self.lock_manager = MongoLockManager(db_client, self.trader_id, self.instance_id, self.logger)
         self.state_manager = MongoStateManager(db_client, self.trader_id, self.logger)
@@ -78,7 +86,6 @@ class Trader:
             exchange_class = getattr(ccxt, self.exchange_id)
             self.exchange = exchange_class(credentials)
             self.exchange.options['defaultType'] = 'future'
-            # IMPORTANT: For live trading, REMOVE OR COMMENT OUT testnet lines.
             # if self.exchange_id in ['binance', 'okx']: self.exchange.set_sandbox_mode(True)
         except AttributeError:
             self.logger.critical(f"Exchange '{self.exchange_id}' is not supported by CCXT."); raise
@@ -164,14 +171,22 @@ class Trader:
             except Exception as e: self.logger.warning(f"Error during intra-candle check: {e}")
             time.sleep(INTRA_CANDLE_CHECK_INTERVAL_S)
         self.logger.info("Intra-candle monitoring finished.")
+    
+    # --- FIX: Renamed and upgraded ---
     def update_latest_closed_candle_data(self):
         if not self.lock_manager.verify(): raise LockLostError()
         self.load_dynamic_settings()
+        
+        # --- FIX: Fetch high-timeframe data if needed ---
+        if self.high_timeframe:
+            self.fetch_high_timeframe_data()
+        
         df = self.fetch_latest_candle_data_with_polling()
         if df is not None:
             self.last_candle_timestamp = df.index[-1]; self.state_manager.save_state(self.get_current_state_dict())
             self.check_for_signals_and_manage_position(df)
         else: self.logger.warning("Failed to fetch new data after polling.")
+    
     def fetch_latest_candle_data_with_polling(self):
         start_time = time.time(); self.logger.info("Polling for next closed candle...")
         while time.time() - start_time < DATA_POLLING_TIMEOUT_S:
@@ -184,6 +199,21 @@ class Trader:
                 else: time.sleep(DATA_POLLING_INTERVAL_S)
             except Exception as e: self.logger.warning(f"Error during polling: {e}. Retrying..."); time.sleep(DATA_POLLING_INTERVAL_S)
         self.logger.error("Data polling timed out."); return None
+        
+    # --- FIX: New method to fetch high-TF data ---
+    def fetch_high_timeframe_data(self):
+        try:
+            self.logger.info(f"Fetching high-timeframe data ({self.high_timeframe})...")
+            # Fetch enough candles to satisfy the strategy's EMA (e.g., 200)
+            candles = self.exchange.fetch_ohlcv(self.symbol, self.high_timeframe, limit=250)
+            df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+            df.set_index('timestamp', inplace=True)
+            self.high_tf_df = df
+        except Exception as e:
+            self.logger.error(f"Failed to fetch high-timeframe data: {e}")
+            self.high_tf_df = None
+            
     def sleep_until_next_candle(self):
         if self.last_candle_timestamp is None: return
         now_utc = datetime.now(timezone.utc); next_candle_open_time = self.last_candle_timestamp + timedelta(milliseconds=self.timeframe_in_ms)
@@ -191,8 +221,16 @@ class Trader:
         if sleep_duration > 0:
             self.logger.info(f"Next candle at {next_candle_open_time:%H:%M:%S %Z}. Sleeping for {sleep_duration:.2f}s...")
             time.sleep(sleep_duration)
+            
     def check_for_signals_and_manage_position(self, df):
-        _, df_with_indicators = self.strategy.calculate_indicators(None, df.copy())
+        # --- FIX: Pass the high-TF dataframe to the strategy ---
+        _, df_with_indicators = self.strategy.calculate_indicators(self.high_tf_df, df.copy())
+        
+        # --- FIX: Add a guard clause to prevent the crash ---
+        if df_with_indicators is None:
+            self.logger.warning("Strategy returned no data (perhaps high-TF data is missing or insufficient). Skipping signals check.")
+            return
+            
         df_with_indicators.dropna(inplace=True);
         if df_with_indicators.empty: return
         prev_row, current_row = df_with_indicators.iloc[-2], df_with_indicators.iloc[-1]
@@ -201,27 +239,21 @@ class Trader:
             signal_age = (datetime.now(timezone.utc) - current_row.name).total_seconds()
             if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
 
-    # --- FIX: The new, Bybit-aware order confirmation loop ---
     def _await_order_fill(self, order_id, order_type):
         start_time = time.time()
         while time.time() - start_time < CONFIRM_ORDER_TIMEOUT_S:
             self.logger.info(f"Waiting for order {order_id} to fill...")
             try:
                 if self.exchange_id == 'bybit':
-                    # Bybit-specific logic
                     try:
-                        # First check if the order has already been filled
                         order_status = self.exchange.fetch_closed_order(order_id, self.symbol)
                         if order_status['status'] == 'closed':
                             self.logger.info(f"Order {order_id} confirmed as filled (closed).")
                             return order_status['average']
                     except ccxt.OrderNotFound:
-                        # This is expected if the order is still open, so we check open orders
                         self.logger.debug(f"Order {order_id} not in closed orders, checking open orders.")
                         order_status = self.exchange.fetch_open_order(order_id, self.symbol)
-                        # If fetch_open_order succeeds, we just continue the loop
                 else:
-                    # Standard logic for other exchanges
                     order_status = self.exchange.fetch_order(order_id, self.symbol)
                     if order_status['status'] == 'closed':
                         self.logger.info(f"Order {order_id} confirmed as filled.")
@@ -229,15 +261,11 @@ class Trader:
                 
                 if order_status['status'] == 'canceled':
                     self.logger.warning(f"Order {order_id} was canceled."); return None
-
             except ccxt.OrderNotFound:
-                # This can happen in a race condition on any exchange, just continue polling
                 self.logger.warning(f"Order {order_id} not found yet, will retry.")
             except Exception as e:
                 self.logger.warning(f"Could not fetch order status for {order_id}: {e}")
-            
             time.sleep(CONFIRM_ORDER_POLL_INTERVAL_S)
-            
         if order_type == 'limit':
             self.logger.warning(f"Order {order_id} did not fill in time. Canceling.")
             try:
@@ -268,15 +296,12 @@ class Trader:
                 self.logger.info(f"Calculated final order: {formatted_amount} contracts (True Size: {self.trade_size_in_asset:.8f})")
                 order_params = {};
                 if self.exchange_id == 'okx': order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
-                
                 self.logger.info(f"Placing LIMIT order at signal price: {limit_price}...")
                 order = self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
                 order_id = order['id']
-                
                 confirmed_price = self._await_order_fill(order_id, 'limit')
                 if confirmed_price is None:
                     self.logger.error("Could not confirm trade execution. Aborting entry."); return
-
                 self.in_position, self.position_type, self.entry_price = True, signal, confirmed_price
                 self.entry_time = datetime.now(timezone.utc)
                 params = self.config['parameters']
@@ -328,9 +353,7 @@ class Trader:
             formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
             order_params = {};
             if self.exchange_id == 'okx': order_params['posSide'] = 'long' if self.position_type == 'LONG' else 'short'
-            
             order_type = 'limit' if exit_reason == "Take-Profit" else 'market'
-            
             if order_type == 'limit':
                 exit_price_target = self.exchange.price_to_precision(self.symbol, self.take_profit_price)
                 self.logger.info(f"Placing LIMIT order at {exit_price_target}")
@@ -338,24 +361,19 @@ class Trader:
             else:
                 self.logger.info("Placing MARKET order for immediate exit.")
                 order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
-
             confirmed_exit_price = self._await_order_fill(order['id'], order_type)
-
             if confirmed_exit_price is None:
                 self.logger.error(f"Could not confirm exit for order {order['id']}. Position may still be open.")
                 if order_type == 'limit': return
                 return
-
             exit_time = datetime.now(timezone.utc)
             pnl = ((confirmed_exit_price - self.entry_price) if self.position_type == 'LONG' else (self.entry_price - confirmed_exit_price)) * self.trade_size_in_asset
             self.logger.info(f"--- POSITION CLOSED --- PnL: ${pnl:.2f}")
             trade_record = {'trader_id': self.trader_id, 'instance_id': self.instance_id, 'exchange': self.exchange_id, 'symbol': self.symbol, 'position_type': self.position_type, 'entry_price': self.entry_price, 'exit_price': confirmed_exit_price, 'entry_time': self.entry_time, 'exit_time': exit_time, 'trade_size': self.trade_size_in_asset, 'pnl': pnl, 'exit_reason': exit_reason}
             self.state_manager.save_trade_history(trade_record)
-            
             self.in_position, self.position_type, self.entry_price, self.trade_size_in_asset, self.entry_time = False, None, 0, 0, None
             self.stop_loss_price, self.take_profit_price = None, None
             self.state_manager.save_state(self.get_current_state_dict())
-            
             if self.operational_mode == 'exit_all':
                 self.operational_mode = 'standby'
                 self.state_manager.db['trader_controls'].update_one({'_id': self.trader_id}, {'$set': {'operational_mode': 'standby'}})
@@ -383,4 +401,3 @@ if __name__ == '__main__':
         except Exception as e: logger.critical(f"Failed to initialize or run Trader. Error: {e}", exc_info=True)
         finally:
             if db_client: db_client.close(); logger.info("MongoDB connection closed.")
-

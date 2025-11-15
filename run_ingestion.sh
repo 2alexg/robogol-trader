@@ -7,7 +7,7 @@
 # --- IMPORTANT ---
 # Set the absolute path to your project directory.
 # Replace "/home/your_username/crypto_bot" with your actual path.
-PROJECT_DIR="/home/alexgol/Projects/RoboGol_trader_2"
+PROJECT_DIR="/home/alexgol/Projects/robogol-trader"
 
 # --- Venv Activation ---
 # Set the name of your virtual environment folder. 'venv' is a common name.
@@ -23,7 +23,7 @@ echo "--- Venv activated. Running ingestion script at $(date) ---"
 
 # --- Run the Python Script ---
 # Run the main data ingestion engine script using the venv's python.
-python3 data_ingestion_engine.py
+python3 data_ingestion_engine.py --since "2023-01-01"
 
 echo "--- Ingestion script finished at $(date) ---"
 

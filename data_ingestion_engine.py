@@ -7,7 +7,7 @@
 # Configuration is loaded from an external config.py file.
 #
 # Author: Gemini
-# Date: 2025-07-26 (v6 - Externalized configuration)
+# Date: 2025-10-18 (v9 - Added batching to prevent BSONObjectTooLarge error)
 
 import ccxt
 import pandas as pd
@@ -17,6 +17,9 @@ from abc import ABC, abstractmethod
 import time
 import datetime
 import os
+import argparse  # Added for command-line arguments
+import sys         # Added for exiting
+import numpy as np # Added for array_split
 
 # --- Configuration ---
 # All settings are now loaded from the config.py file.
@@ -25,7 +28,10 @@ try:
 except ImportError:
     print("Error: Configuration file 'config.py' not found.")
     print("Please create it in the same directory as this script.")
-    exit()
+    sys.exit(1)
+
+# --- FIX: Define a batch size for MongoDB operations ---
+MONGO_BATCH_SIZE = 10000
 
 
 # --- 1. Data Fetcher ---
@@ -48,36 +54,66 @@ class DataFetcher:
         except Exception as e:
             raise ConnectionError(f"Failed to connect to {exchange_id}: {e}")
 
-    def fetch_ohlcv(self, symbol, timeframe, since=None, limit=config.CANDLE_LIMIT):
+    def fetch_all_ohlcv_since(self, symbol, timeframe, since=None, limit=config.CANDLE_LIMIT):
         """
-        Fetches OHLCV data for a given symbol and timeframe.
+        Fetches ALL OHLCV data for a given symbol and timeframe since a
+        specific timestamp, iterating as needed.
         """
         if not self.exchange.has['fetchOHLCV']:
             print(f"Warning: {self.exchange.name} does not support fetchOHLCV.")
-            return []
+            return pd.DataFrame()
 
-        try:
-            print(f"Fetching {symbol} ({timeframe}) data...")
-            # Fetch the data from the exchange
-            ohlcv_data = self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
-            
-            if not ohlcv_data:
-                print(f"No new data found for {symbol} ({timeframe}).")
-                return pd.DataFrame()
+        all_candles = []
+        fetch_since = since
+        timeframe_in_ms = self.exchange.parse_timeframe(timeframe) * 1000
+        
+        print(f"Fetching all {symbol} ({timeframe}) data... This may take a while.")
 
-            # Convert to a pandas DataFrame for easier manipulation
-            df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            # Convert timestamp to a readable datetime format (UTC)
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-            print(f"Fetched {len(df)} candles for {symbol} ({timeframe}).")
-            return df
-        except ccxt.NetworkError as e:
-            print(f"Network error while fetching {symbol}: {e}")
-        except ccxt.ExchangeError as e:
-            print(f"Exchange error while fetching {symbol}: {e}")
-        except Exception as e:
-            print(f"An unexpected error occurred while fetching {symbol}: {e}")
-        return pd.DataFrame()
+        while True:
+            try:
+                print(f"  Fetching {limit} candles from {datetime.datetime.fromtimestamp(fetch_since / 1000, tz=datetime.timezone.utc) if fetch_since else 'exchange default'}...")
+                # Fetch the data from the exchange
+                ohlcv_data = self.exchange.fetch_ohlcv(symbol, timeframe, since=fetch_since, limit=limit)
+                
+                if not ohlcv_data:
+                    print("  No more new data found.")
+                    break  # Exit loop if no data is returned
+
+                all_candles.extend(ohlcv_data)
+                
+                # Get the timestamp of the last candle and add 1ms to avoid overlap
+                last_timestamp = ohlcv_data[-1][0]
+                fetch_since = last_timestamp + 1 
+                
+                # Break if we received fewer candles than the limit, meaning we're at the end
+                if len(ohlcv_data) < limit:
+                    print("  Received last batch of data.")
+                    break
+                
+                # Be respectful to the exchange's API rate limits
+                time.sleep(self.exchange.rateLimit / 1000)
+
+            except ccxt.NetworkError as e:
+                print(f"Network error while fetching {symbol}: {e}. Retrying in 5s...")
+                time.sleep(5)
+            except ccxt.ExchangeError as e:
+                print(f"Exchange error while fetching {symbol}: {e}")
+                break
+            except Exception as e:
+                print(f"An unexpected error occurred while fetching {symbol}: {e}")
+                break
+        
+        if not all_candles:
+            return pd.DataFrame()
+
+        # Convert to a pandas DataFrame for easier manipulation
+        df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Convert timestamp to a readable datetime format (UTC)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        # Remove duplicates, keeping the last entry (most recent data)
+        df = df.drop_duplicates(subset=['timestamp'], keep='last')
+        print(f"Fetched a total of {len(df)} unique candles for {symbol} ({timeframe}).")
+        return df
 
 
 # --- 2. Data Repository (Abstract Base Class) ---
@@ -101,7 +137,9 @@ class DataRepository(ABC):
 class MongoRepository(DataRepository):
     """
     Manages storing and retrieving data from a MongoDB database.
-    This implementation uses MongoDB's Time Series collections for efficiency.
+    This implementation uses MongoDB's Time Series collections for efficiency
+    and a "delete-then-insert" pattern to overwrite existing data.
+    It processes data in batches to avoid BSON size limits.
     """
     def __init__(self, mongo_uri, db_name):
         self.client = MongoClient(mongo_uri)
@@ -111,7 +149,6 @@ class MongoRepository(DataRepository):
     def _ensure_timeseries_collection(self, collection_name):
         """
         Ensures a time series collection exists.
-        NOTE: Unique indexes are not supported, so we don't create one.
         """
         try:
             # Attempt to create the collection
@@ -130,8 +167,8 @@ class MongoRepository(DataRepository):
 
     def save_ohlcv(self, df, symbol, timeframe):
         """
-        Saves a DataFrame of OHLCV data to the appropriate MongoDB collection.
-        Assumes the DataFrame contains only new, non-duplicate data.
+        Saves a DataFrame of OHLCV data to MongoDB using a "delete and insert"
+        strategy, processed in batches to avoid 16MB BSON limit.
         """
         if df.empty:
             print("No new data to save.")
@@ -141,17 +178,52 @@ class MongoRepository(DataRepository):
         self._ensure_timeseries_collection(collection_name)
         collection = self.db[collection_name]
 
-        # Prepare records for insertion
-        records = df.to_dict('records')
-        # Add metadata to each record
-        for record in records:
-            record['metadata'] = {'symbol': symbol, 'timeframe': timeframe}
+        # --- FIX: Split DataFrame into manageable chunks ---
+        num_chunks = int(np.ceil(len(df) / MONGO_BATCH_SIZE))
+        df_chunks = np.array_split(df, num_chunks)
+        
+        print(f"Total records to save: {len(df)}. Processing in {num_chunks} batch(es) of {MONGO_BATCH_SIZE}...")
 
-        try:
-            collection.insert_many(records)
-            print(f"Successfully inserted {len(records)} new records into '{collection_name}'.")
-        except Exception as e:
-            print(f"An unexpected error occurred during bulk insert: {e}")
+        total_deleted = 0
+        total_inserted = 0
+
+        for i, batch_df in enumerate(df_chunks):
+            if batch_df.empty:
+                continue
+                
+            print(f"  Processing batch {i+1}/{num_chunks} ({len(batch_df)} records)...")
+            
+            # Prepare records for insertion
+            records = batch_df.to_dict('records')
+            
+            # Get list of timestamps to delete/overwrite
+            timestamps_to_overwrite = batch_df['timestamp'].to_list()
+
+            # Add metadata to each record *before* inserting
+            for record in records:
+                record['metadata'] = {'symbol': symbol, 'timeframe': timeframe}
+
+            try:
+                # Step 1: Delete any existing records with these timestamps
+                if timestamps_to_overwrite:
+                    delete_result = collection.delete_many(
+                        {'timestamp': {'$in': timestamps_to_overwrite}}
+                    )
+                    print(f"    Removed {delete_result.deleted_count} old record(s) for overwrite.")
+                    total_deleted += delete_result.deleted_count
+                
+                # Step 2: Insert the new records
+                insert_result = collection.insert_many(records)
+                print(f"    Successfully inserted {len(insert_result.inserted_ids)} new/overwritten record(s).")
+                total_inserted += len(insert_result.inserted_ids)
+
+            except Exception as e:
+                print(f"An unexpected error occurred during batch {i+1} delete/insert: {e}")
+                print("    Skipping this batch and continuing...")
+        
+        print(f"Save operation complete for '{collection_name}':")
+        print(f"  Total old records removed: {total_deleted}")
+        print(f"  Total new records inserted: {total_inserted}")
 
 
     def get_latest_timestamp(self, symbol, timeframe):
@@ -179,7 +251,29 @@ def main():
     """
     Main function to run the data ingestion engine.
     """
-    print("--- Starting Data Ingestion Engine ---")
+    
+    # --- Add Argument Parsing ---
+    parser = argparse.ArgumentParser(description='Crypto OHLCV Data Ingestion Engine.')
+    parser.add_argument(
+        '--since',
+        type=str,
+        help='Start date for historical data pull (e.g., "2023-01-01"). Overrides database check.'
+    )
+    args = parser.parse_args()
+    
+    cli_since_ms = None
+    if args.since:
+        try:
+            # Convert YYYY-MM-DD string to a UTC timestamp in milliseconds
+            dt = datetime.datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+            cli_since_ms = int(dt.timestamp() * 1000)
+            print(f"--- Manual Backfill Mode: Fetching data since {args.since} ---")
+        except ValueError:
+            print(f"Error: Invalid date format for --since. Please use YYYY-MM-DD.")
+            sys.exit(1)
+    else:
+         print("--- Starting Data Ingestion Engine (Incremental Mode) ---")
+
     
     # Initialize components using settings from config.py
     fetcher = DataFetcher(config.EXCHANGE)
@@ -191,17 +285,23 @@ def main():
             print("-" * 50)
             print(f"Processing: {symbol} - {timeframe}")
             
-            # 1. Find the last entry to avoid re-downloading everything
-            latest_timestamp_ms = repository.get_latest_timestamp(symbol, timeframe)
-            since = None
-            if latest_timestamp_ms:
-                since = latest_timestamp_ms
-                print(f"Last record found at: {datetime.datetime.fromtimestamp(latest_timestamp_ms / 1000, tz=datetime.timezone.utc)}")
+            # 1. Determine the final 'since' timestamp to use
+            # Prioritize the command-line argument if it was provided
+            final_since_ms = None
+            if cli_since_ms is not None:
+                final_since_ms = cli_since_ms
+                print(f"Using manual start date: {args.since}")
             else:
-                print("No previous data found. Fetching from the beginning (up to limit).")
-
-            # 2. Fetch new data from the exchange
-            ohlcv_df = fetcher.fetch_ohlcv(symbol, timeframe, since=since)
+                # Fall back to the old logic: get latest from DB
+                latest_timestamp_ms = repository.get_latest_timestamp(symbol, timeframe)
+                if latest_timestamp_ms:
+                    final_since_ms = latest_timestamp_ms
+                    print(f"Resuming from last record in DB: {datetime.datetime.fromtimestamp(latest_timestamp_ms / 1000, tz=datetime.timezone.utc)}")
+                else:
+                    print("No previous data found. Fetching from the beginning (up to exchange limit).")
+            
+            # 2. Fetch all new data from the exchange
+            ohlcv_df = fetcher.fetch_all_ohlcv_since(symbol, timeframe, since=final_since_ms, limit=config.CANDLE_LIMIT)
             
             # 3. Process and save the new data
             if not ohlcv_df.empty:
@@ -223,22 +323,11 @@ def main():
                 except Exception as e:
                     print(f"Could not check for incomplete candle: {e}")
 
-                # *** APPLICATION-SIDE DE-DUPLICATION ***
-                # If we have a latest timestamp, filter the fetched data to ensure
-                # we only insert candles that are strictly newer.
-                if latest_timestamp_ms:
-                    latest_datetime_utc = pd.to_datetime(latest_timestamp_ms, unit='ms', utc=True)
-                    original_count = len(ohlcv_df)
-                    ohlcv_df = ohlcv_df[ohlcv_df['timestamp'] > latest_datetime_utc]
-                    new_count = len(ohlcv_df)
-                    if new_count < original_count:
-                        print(f"Removed {original_count - new_count} overlapping candle(s) before saving.")
-
-                # Save the new, clean, de-duplicated data to the database
+                # Save the new, clean data to the database
                 repository.save_ohlcv(ohlcv_df, symbol, timeframe)
             
             # 4. Be respectful to the exchange's API rate limits
-            time.sleep(fetcher.exchange.rateLimit / 1000)
+            # (Handled inside the fetch_all_ohlcv_since loop)
 
     print("\n--- Data Ingestion Engine finished its run. ---")
 

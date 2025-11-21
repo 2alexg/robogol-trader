@@ -6,7 +6,7 @@
 # multi-timeframe strategies, loaded from dynamically specified config files.
 #
 # Author: Gemini
-# Date: 2025-09-13 (v21 - Corrected and final version)
+# Date: 2025-11-15 (v22 - MTF-Aware Fix)
 
 import random
 import numpy as np
@@ -89,13 +89,23 @@ def run_backtest(individual, strategy_config, data_manager):
     try:
         params['symbol'] = strategy_config['symbol']
         
-        if strategy_class.is_multi_timeframe:
+        # Check if the config specifies a high_timeframe (the new way)
+        high_timeframe = strategy_config.get('high_timeframe')
+        
+        if high_timeframe:
+            # New MTF logic
+            df_htf = data_manager.get_data(params['symbol'], high_timeframe)
+            df_ltf = data_manager.get_data(params['symbol'], strategy_config['timeframe'])
+            if df_htf is None or df_htf.empty or df_ltf is None or df_ltf.empty: return (-99998,)
+        elif strategy_class.is_multi_timeframe:
+            # Old MTF logic (based on 'htf' and 'ltf' keys)
             params['htf'] = strategy_config['htf']
             params['ltf'] = strategy_config['ltf']
             df_htf = data_manager.get_data(params['symbol'], params['htf'])
             df_ltf = data_manager.get_data(params['symbol'], params['ltf'])
             if df_htf is None or df_htf.empty or df_ltf is None or df_ltf.empty: return (-99998,)
         else:
+            # Single Timeframe logic
             params['timeframe'] = strategy_config['timeframe']
             df_ltf = data_manager.get_data(params['symbol'], params['timeframe'])
             if df_ltf is None or df_ltf.empty: return (-99998,)
@@ -144,17 +154,33 @@ def run_backtest_with_full_stats(params, strategy_config, data_manager):
     params['take_profit_percent'] = params['stop_loss_percent'] * params['rr_ratio']
     strategy_class = strategy_config['strategy_class']
     
-    if strategy_class.is_multi_timeframe:
+    # --- FIX: Replicate the MTF data loading logic from run_backtest ---
+    high_timeframe = strategy_config.get('high_timeframe')
+    df_htf = None
+    df_ltf = None
+    
+    if high_timeframe:
+        df_htf = data_manager.get_data(params['symbol'], high_timeframe)
+        df_ltf = data_manager.get_data(params['symbol'], strategy_config['timeframe'])
+    elif strategy_class.is_multi_timeframe:
         df_htf = data_manager.get_data(params['symbol'], params['htf'])
         df_ltf = data_manager.get_data(params['symbol'], params['ltf'])
     else:
         df_ltf = data_manager.get_data(params['symbol'], params['timeframe'])
         df_htf = None
+    # --- End of FIX ---
 
     capital = INITIAL_CAPITAL
     position = None
     strategy = strategy_class(params)
     df_htf, aligned_df = strategy.calculate_indicators(df_htf, df_ltf)
+    
+    # --- FIX: Add the missing guard clause ---
+    if aligned_df is None:
+        print("Warning: Strategy returned no data for full stats. Aborting report.")
+        return { "Final PnL": 0, "Total Trades": 0, "Win Rate (%)": 0, "Max Drawdown (%)": 0, "Profit Factor": 0, "Sharpe Ratio": 0 }
+    # --- End of FIX ---
+        
     aligned_df.dropna(inplace=True)
 
     equity_curve = [INITIAL_CAPITAL]
@@ -247,12 +273,20 @@ def run_optimization(strategy_config):
     toolbox.register("mutate", custom_mutate)
     toolbox.register("mate", tools.cxTwoPoint)
     
-    required_tfs = []
-    if strategy_class.is_multi_timeframe:
-        required_tfs.extend([strategy_config['htf'], strategy_config['ltf']])
-    else:
-        required_tfs.append(strategy_config['timeframe'])
-    data_manager = DataManager([strategy_config['symbol']], list(set(required_tfs)))
+    # --- FIX: Correctly gather all required timeframes ---
+    required_tfs = set()
+    if strategy_config.get('high_timeframe'):
+        required_tfs.add(strategy_config['high_timeframe'])
+    if strategy_config.get('timeframe'):
+        required_tfs.add(strategy_config['timeframe'])
+    # For legacy MTF configs
+    if strategy_config.get('htf'):
+        required_tfs.add(strategy_config['htf'])
+    if strategy_config.get('ltf'):
+        required_tfs.add(strategy_config['ltf'])
+        
+    data_manager = DataManager([strategy_config['symbol']], list(required_tfs))
+    # --- End of FIX ---
     
     toolbox.register("evaluate", run_backtest, strategy_config=strategy_config, data_manager=data_manager)
     toolbox.register("select", tools.selTournament, tournsize=3)
@@ -280,11 +314,16 @@ def run_optimization(strategy_config):
         print(f"  {key}: {val:.4f}" if isinstance(val, float) else f"  {key}: {val}")
     
     best_params_decoded['symbol'] = strategy_config['symbol']
-    if strategy_class.is_multi_timeframe:
-        best_params_decoded['htf'] = strategy_config['htf']
-        best_params_decoded['ltf'] = strategy_config['ltf']
-    else:
+    # --- FIX: Pass correct timeframe keys for the final report ---
+    if strategy_config.get('high_timeframe'):
+        best_params_decoded['high_timeframe'] = strategy_config['high_timeframe']
+    if strategy_config.get('timeframe'):
         best_params_decoded['timeframe'] = strategy_config['timeframe']
+    if strategy_config.get('htf'):
+        best_params_decoded['htf'] = strategy_config['htf']
+    if strategy_config.get('ltf'):
+        best_params_decoded['ltf'] = strategy_config['ltf']
+    # --- End of FIX ---
 
     print("\n--- Detailed Performance Report for Best Individual ---")
     full_stats = run_backtest_with_full_stats(best_params_decoded, strategy_config, data_manager)
@@ -306,4 +345,3 @@ if __name__ == "__main__":
     
     ga_config = load_config_from_file(args.config)
     run_optimization(ga_config)
-

@@ -2,11 +2,11 @@
 #
 # Description:
 # The complete, definitive, and production-ready multi-exchange live
-# execution engine. This version is multi-timeframe-aware, allowing it
-# to run complex strategies like StochRsiEmaStrategy.
+# execution engine. This version delegates exit price calculations
+# to the strategy, allowing for both % and ATR-based exit logic.
 #
 # Author: Gemini
-# Date: 2025-11-14 (MTF-Aware Version)
+# Date: 2025-11-17 (Strategy-Aware Exits)
 
 import ccxt
 import pandas as pd
@@ -63,7 +63,7 @@ class Trader:
         self.exchange_id = config['exchange'].lower()
         self.logger = logger
         
-        # --- FIX: Check for multi-timeframe requirement ---
+        # --- Check for multi-timeframe requirement ---
         self.high_timeframe = config.get('high_timeframe')
         self.high_tf_df = None # Will hold the high-timeframe data
 
@@ -172,12 +172,11 @@ class Trader:
             time.sleep(INTRA_CANDLE_CHECK_INTERVAL_S)
         self.logger.info("Intra-candle monitoring finished.")
     
-    # --- FIX: Renamed and upgraded ---
     def update_latest_closed_candle_data(self):
         if not self.lock_manager.verify(): raise LockLostError()
         self.load_dynamic_settings()
         
-        # --- FIX: Fetch high-timeframe data if needed ---
+        # Fetch high-timeframe data if needed
         if self.high_timeframe:
             self.fetch_high_timeframe_data()
         
@@ -200,7 +199,6 @@ class Trader:
             except Exception as e: self.logger.warning(f"Error during polling: {e}. Retrying..."); time.sleep(DATA_POLLING_INTERVAL_S)
         self.logger.error("Data polling timed out."); return None
         
-    # --- FIX: New method to fetch high-TF data ---
     def fetch_high_timeframe_data(self):
         try:
             self.logger.info(f"Fetching high-timeframe data ({self.high_timeframe})...")
@@ -223,10 +221,10 @@ class Trader:
             time.sleep(sleep_duration)
             
     def check_for_signals_and_manage_position(self, df):
-        # --- FIX: Pass the high-TF dataframe to the strategy ---
+        # Pass the high-TF dataframe to the strategy
         _, df_with_indicators = self.strategy.calculate_indicators(self.high_tf_df, df.copy())
         
-        # --- FIX: Add a guard clause to prevent the crash ---
+        # Guard clause to prevent crash if strategy returns None
         if df_with_indicators is None:
             self.logger.warning("Strategy returned no data (perhaps high-TF data is missing or insufficient). Skipping signals check.")
             return
@@ -281,7 +279,9 @@ class Trader:
         if not self.lock_manager.verify(): raise LockLostError()
         if self.operational_mode != 'trading':
             self.logger.info(f"Mode is '{self.operational_mode}', skipping entry check."); return
+        
         signal = self.strategy.get_entry_signal(prev_row, current_row)
+        
         if signal:
             self.logger.info(f"!!! ENTRY SIGNAL DETECTED: {signal} !!!")
             try:
@@ -299,19 +299,23 @@ class Trader:
                 self.logger.info(f"Placing LIMIT order at signal price: {limit_price}...")
                 order = self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
                 order_id = order['id']
+                
                 confirmed_price = self._await_order_fill(order_id, 'limit')
                 if confirmed_price is None:
                     self.logger.error("Could not confirm trade execution. Aborting entry."); return
+
                 self.in_position, self.position_type, self.entry_price = True, signal, confirmed_price
                 self.entry_time = datetime.now(timezone.utc)
-                params = self.config['parameters']
-                stop_loss_pct = params['stop_loss_percent']; take_profit_pct = stop_loss_pct * params.get('rr_ratio', 2.0)
-                if signal == 'LONG':
-                    self.stop_loss_price = confirmed_price * (1 - stop_loss_pct)
-                    self.take_profit_price = confirmed_price * (1 + take_profit_pct)
-                else:
-                    self.stop_loss_price = confirmed_price * (1 + stop_loss_pct)
-                    self.take_profit_price = confirmed_price * (1 - take_profit_pct)
+                
+                # --- FIX: Delegate SL/TP calculation to the strategy ---
+                # This is the key change allowing strategies to use custom logic like ATR
+                self.stop_loss_price, self.take_profit_price = self.strategy.calculate_exit_prices(
+                    entry_price=confirmed_price, 
+                    signal=signal, 
+                    current_row=current_row
+                )
+                # --- End of FIX ---
+
                 self.logger.info(f"--- TRADE CONFIRMED --- New Position: {self.position_type} @ {self.entry_price}")
                 self.logger.info(f"SL: {self.stop_loss_price:.{self.price_decimal_places}f}, TP: {self.take_profit_price:.{self.price_decimal_places}f}")
                 self.state_manager.save_state(self.get_current_state_dict())

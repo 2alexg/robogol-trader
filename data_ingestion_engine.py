@@ -277,7 +277,7 @@ def main():
     
     # Initialize components using settings from config.py
     fetcher = DataFetcher(config.EXCHANGE)
-    repository = MongoRepository(config.MONGO_URI, config.MONGO_DB_NAME)
+    repository = MongoRepository(config.OPTIM_MONGO_URI, config.OPTIM_MONGO_DB_NAME)
 
     # Loop through each symbol and timeframe from the configuration
     for symbol in config.SYMBOLS:

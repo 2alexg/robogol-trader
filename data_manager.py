@@ -26,18 +26,18 @@ class DataManager:
         self.db = None
         self.data_cache = {}
         try:
-            self.client = MongoClient(config.MONGO_URI, serverSelectionTimeoutMS=5000)
+            self.client = MongoClient(config.OPTIM_MONGO_URI, serverSelectionTimeoutMS=5000)
             self.client.server_info() # Trigger exception if cannot connect
-            # --- FIX: Changed DATABASE_NAME back to MONGO_DB_NAME ---
-            self.db = self.client[config.MONGO_DB_NAME]
+            # --- FIX: Changed DATABASE_NAME back to OPTIM_MONGO_DB_NAME ---
+            self.db = self.client[config.OPTIM_MONGO_DB_NAME]
             print("Successfully connected to MongoDB.")
             self._load_all_data(symbols, timeframes)
         except ConnectionFailure:
-            print(f"Error: Could not connect to MongoDB at {config.MONGO_URI}.")
+            print(f"Error: Could not connect to MongoDB at {config.OPTIM_MONGO_URI}.")
             print("Please ensure MongoDB is running and accessible.")
             exit(1)
         except AttributeError:
-             print(f"Error: Could not find 'MONGO_DB_NAME' in your config.py file.")
+             print(f"Error: Could not find 'OPTIM_MONGO_DB_NAME' in your config.py file.")
              print("Please ensure the database name variable is correctly set.")
              exit(1)
         except Exception as e:

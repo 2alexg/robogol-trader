@@ -3,11 +3,11 @@
 # Description:
 # The complete, definitive, and production-ready multi-exchange live
 # execution engine. This version delegates exit price calculations
-# to the strategy, allowing for both % and ATR-based exit logic.
+# to the strategy and includes a 'Paper Trading' mode for simulation.
 #
 # Author: Gemini
 # Date: 2025-11-17 (Strategy-Aware Exits)
-# Updated: 2025-12-19 (Partial Fill Handling)
+# Updated: 2025-12-19 (Partial Fill Handling & Paper Trading Mode)
 
 import ccxt
 import pandas as pd
@@ -39,9 +39,10 @@ DEFAULT_TRADE_SIZE_USD = 20.0; MAX_SLIPPAGE_TICKS = 5; INTRA_CANDLE_CHECK_INTERV
 CONFIRM_ORDER_TIMEOUT_S = 30; CONFIRM_ORDER_POLL_INTERVAL_S = 2
 
 # --- Logging & Helper Functions (Unchanged) ---
-def setup_logging(trader_id):
+def setup_logging(trader_id, paper_trading=False):
     for handler in logging.root.handlers[:]: logging.root.removeHandler(handler)
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(trader_id)s] - %(levelname)s - %(message)s',
+    prefix = "[PAPER] " if paper_trading else ""
+    logging.basicConfig(level=logging.INFO, format=f'%(asctime)s - {prefix}[%(trader_id)s] - %(levelname)s - %(message)s',
         handlers=[logging.FileHandler("trader.log"), logging.StreamHandler()])
     return logging.LoggerAdapter(logging.getLogger(__name__), {'trader_id': trader_id})
 def load_config(filepath):
@@ -63,6 +64,7 @@ class Trader:
         self.config = config; self.symbol = config['symbol']; self.timeframe = config['timeframe']
         self.exchange_id = config['exchange'].lower()
         self.logger = logger
+        self.paper_trading = config.get('paper_trading', False)
         
         # --- Check for multi-timeframe requirement ---
         self.high_timeframe = config.get('high_timeframe')
@@ -70,7 +72,12 @@ class Trader:
 
         sanitized_symbol = re.sub(r'[^a-zA-Z0-9]', '', self.symbol)
         self.trader_id = f"{self.exchange_id}_{config['strategy_name']}_{sanitized_symbol}_{self.timeframe}"
+        if self.paper_trading: self.trader_id += "_PAPER"
+        
         self.logger.info(f"Initializing trader with ID: {self.trader_id}")
+        if self.paper_trading:
+            self.logger.info("!!! RUNNING IN PAPER TRADING MODE - NO REAL ORDERS WILL BE EXECUTED !!!")
+
         if self.high_timeframe:
             self.logger.info(f"Multi-timeframe strategy detected. High TF: {self.high_timeframe}")
             
@@ -315,13 +322,21 @@ class Trader:
                 formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
                 self.trade_size_in_asset = final_amount_in_asset
                 self.logger.info(f"Calculated final order: {formatted_amount} contracts (True Size: {self.trade_size_in_asset:.8f})")
-                order_params = {};
-                if self.exchange_id == 'okx': order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
-                self.logger.info(f"Placing LIMIT order at signal price: {limit_price}...")
-                order = self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
-                order_id = order['id']
                 
-                filled_qty, confirmed_price = self._await_order_fill(order_id, 'limit')
+                if self.paper_trading:
+                    # --- PAPER TRADING SIMULATION ---
+                    self.logger.info(f"PAPER TRADING: Simulating ENTRY order of {formatted_amount} contracts at {limit_price}...")
+                    filled_qty = self.trade_size_in_asset # Assume full fill
+                    confirmed_price = float(limit_price)  # Assume fill at limit price
+                else:
+                    # --- REAL TRADING EXECUTION ---
+                    order_params = {};
+                    if self.exchange_id == 'okx': order_params['posSide'] = 'long' if signal == 'LONG' else 'short'
+                    self.logger.info(f"Placing LIMIT order at signal price: {limit_price}...")
+                    order = self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
+                    order_id = order['id']
+                    
+                    filled_qty, confirmed_price = self._await_order_fill(order_id, 'limit')
                 
                 if filled_qty == 0 or confirmed_price is None:
                     self.logger.error("Could not confirm trade execution (No fill). Aborting entry."); return
@@ -382,21 +397,40 @@ class Trader:
         try:
             quantity_in_contracts = self.trade_size_in_asset / self.contract_size
             formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
-            order_params = {};
-            if self.exchange_id == 'okx': order_params['posSide'] = 'long' if self.position_type == 'LONG' else 'short'
             order_type = 'limit' if exit_reason == "Take-Profit" else 'market'
-            if order_type == 'limit':
-                exit_price_target = self.exchange.price_to_precision(self.symbol, self.take_profit_price)
-                self.logger.info(f"Placing LIMIT order at {exit_price_target}")
-                order = self.exchange.create_limit_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), float(exit_price_target), params=order_params)
-            else:
-                self.logger.info("Placing MARKET order for immediate exit.")
-                order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
             
-            filled_qty, confirmed_exit_price = self._await_order_fill(order['id'], order_type)
+            if self.paper_trading:
+                # --- PAPER TRADING SIMULATION ---
+                self.logger.info(f"PAPER TRADING: Simulating EXIT ({order_type})...")
+                filled_qty = self.trade_size_in_asset # Assume full fill
+                
+                if order_type == 'limit':
+                    # For limit (TP), we assume we exited exactly at our target price
+                    confirmed_exit_price = self.take_profit_price
+                else:
+                    # For market (SL/Manual), we fetch the current last price to simulate market fill
+                    ticker = self.exchange.fetch_ticker(self.symbol)
+                    confirmed_exit_price = ticker['last']
+                    
+                self.logger.info(f"PAPER TRADING: Simulated exit price: {confirmed_exit_price}")
+            
+            else:
+                # --- REAL TRADING EXECUTION ---
+                order_params = {};
+                if self.exchange_id == 'okx': order_params['posSide'] = 'long' if self.position_type == 'LONG' else 'short'
+                
+                if order_type == 'limit':
+                    exit_price_target = self.exchange.price_to_precision(self.symbol, self.take_profit_price)
+                    self.logger.info(f"Placing LIMIT order at {exit_price_target}")
+                    order = self.exchange.create_limit_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), float(exit_price_target), params=order_params)
+                else:
+                    self.logger.info("Placing MARKET order for immediate exit.")
+                    order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
+                
+                filled_qty, confirmed_exit_price = self._await_order_fill(order['id'], order_type)
             
             if filled_qty == 0 or confirmed_exit_price is None:
-                self.logger.error(f"Could not confirm exit for order {order['id']}. Position may still be open.")
+                self.logger.error(f"Could not confirm exit. Position may still be open.")
                 if order_type == 'limit': return
                 return
             
@@ -404,7 +438,7 @@ class Trader:
             # Use actual filled_qty for PnL calculation
             pnl = ((confirmed_exit_price - self.entry_price) if self.position_type == 'LONG' else (self.entry_price - confirmed_exit_price)) * filled_qty
             self.logger.info(f"--- POSITION CLOSED --- PnL: ${pnl:.2f}")
-            trade_record = {'trader_id': self.trader_id, 'instance_id': self.instance_id, 'exchange': self.exchange_id, 'symbol': self.symbol, 'position_type': self.position_type, 'entry_price': self.entry_price, 'exit_price': confirmed_exit_price, 'entry_time': self.entry_time, 'exit_time': exit_time, 'trade_size': filled_qty, 'pnl': pnl, 'exit_reason': exit_reason}
+            trade_record = {'trader_id': self.trader_id, 'instance_id': self.instance_id, 'exchange': self.exchange_id, 'symbol': self.symbol, 'position_type': self.position_type, 'entry_price': self.entry_price, 'exit_price': confirmed_exit_price, 'entry_time': self.entry_time, 'exit_time': exit_time, 'trade_size': filled_qty, 'pnl': pnl, 'exit_reason': exit_reason, 'is_paper': self.paper_trading}
             self.state_manager.save_trade_history(trade_record)
             self.in_position, self.position_type, self.entry_price, self.trade_size_in_asset, self.entry_time = False, None, 0, 0, None
             self.stop_loss_price, self.take_profit_price = None, None
@@ -417,15 +451,21 @@ class Trader:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Live crypto trading bot.')
     parser.add_argument('--config', type=str, required=True, help='Path to the strategy JSON config file.')
+    parser.add_argument('--paper-trading', action='store_true', help='Enable paper trading mode (simulation only).')
     args = parser.parse_args()
     config = load_config(args.config)
     db_client = None; logger = logging.getLogger(__name__)
     if config:
         try:
+            # Inject paper trading flag into config
+            config['paper_trading'] = args.paper_trading
+            
             exchange_id = config.get('exchange', 'unknown').lower()
             sanitized_symbol = re.sub(r'[^a-zA-Z0-9]', '', config.get('symbol', ''))
             trader_id = f"{exchange_id}_{config.get('strategy_name', 'UnknownStrategy')}_{sanitized_symbol}_{config.get('timeframe', '')}"
-            logger = setup_logging(trader_id)
+            if args.paper_trading: trader_id += "_PAPER"
+            
+            logger = setup_logging(trader_id, args.paper_trading)
             logger.info("Establishing timezone-aware connection to MongoDB...")
             db_client = MongoClient(main_config.MONGO_URI, serverSelectionTimeoutMS=5000, tz_aware=True)
             db_client.server_info()

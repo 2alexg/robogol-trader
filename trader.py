@@ -7,6 +7,7 @@
 #
 # Author: Gemini
 # Date: 2025-11-17 (Strategy-Aware Exits)
+# Updated: 2025-12-19 (Partial Fill Handling)
 
 import ccxt
 import pandas as pd
@@ -238,6 +239,11 @@ class Trader:
             if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
 
     def _await_order_fill(self, order_id, order_type):
+        """
+        Waits for order to fill. Returns (filled_amount, average_price).
+        If partial fill occurs on timeout/cancel, returns the partial amount.
+        Returns (0, None) on total failure.
+        """
         start_time = time.time()
         while time.time() - start_time < CONFIRM_ORDER_TIMEOUT_S:
             self.logger.info(f"Waiting for order {order_id} to fill...")
@@ -247,7 +253,7 @@ class Trader:
                         order_status = self.exchange.fetch_closed_order(order_id, self.symbol)
                         if order_status['status'] == 'closed':
                             self.logger.info(f"Order {order_id} confirmed as filled (closed).")
-                            return order_status['average']
+                            return order_status.get('filled', 0), order_status['average']
                     except ccxt.OrderNotFound:
                         self.logger.debug(f"Order {order_id} not in closed orders, checking open orders.")
                         order_status = self.exchange.fetch_open_order(order_id, self.symbol)
@@ -255,25 +261,40 @@ class Trader:
                     order_status = self.exchange.fetch_order(order_id, self.symbol)
                     if order_status['status'] == 'closed':
                         self.logger.info(f"Order {order_id} confirmed as filled.")
-                        return order_status['average']
+                        return order_status.get('filled', 0), order_status['average']
                 
+                # If canceled externally, return whatever was filled
                 if order_status['status'] == 'canceled':
-                    self.logger.warning(f"Order {order_id} was canceled."); return None
+                    filled = order_status.get('filled', 0)
+                    if filled > 0:
+                        self.logger.warning(f"Order {order_id} was canceled but partially filled.")
+                        return filled, order_status['average']
+                    self.logger.warning(f"Order {order_id} was canceled."); return 0, None
+
             except ccxt.OrderNotFound:
                 self.logger.warning(f"Order {order_id} not found yet, will retry.")
             except Exception as e:
                 self.logger.warning(f"Could not fetch order status for {order_id}: {e}")
             time.sleep(CONFIRM_ORDER_POLL_INTERVAL_S)
+            
         if order_type == 'limit':
             self.logger.warning(f"Order {order_id} did not fill in time. Canceling.")
             try:
                 self.exchange.cancel_order(order_id, self.symbol)
                 self.logger.info(f"Successfully canceled order {order_id}.")
+                
+                # Fetch final state to check for partial fills
+                final_status = self.exchange.fetch_order(order_id, self.symbol)
+                filled = final_status.get('filled', 0)
+                if filled > 0:
+                    self.logger.info(f"Partial fill detected on timeout/cancel: {filled} contracts.")
+                    return filled, final_status['average']
+                    
             except Exception as e:
                 self.logger.error(f"Failed to cancel order {order_id}. MANUAL INTERVENTION REQUIRED! Error: {e}")
         else:
             self.logger.error(f"MARKET order {order_id} did not fill in time. MANUAL INTERVENTION REQUIRED!")
-        return None
+        return 0, None
             
     def check_for_entry(self, prev_row, current_row):
         if not self.lock_manager.verify(): raise LockLostError()
@@ -300,9 +321,15 @@ class Trader:
                 order = self.exchange.create_limit_order(self.symbol, 'buy' if signal == 'LONG' else 'sell', float(formatted_amount), float(limit_price), params=order_params)
                 order_id = order['id']
                 
-                confirmed_price = self._await_order_fill(order_id, 'limit')
-                if confirmed_price is None:
-                    self.logger.error("Could not confirm trade execution. Aborting entry."); return
+                filled_qty, confirmed_price = self._await_order_fill(order_id, 'limit')
+                
+                if filled_qty == 0 or confirmed_price is None:
+                    self.logger.error("Could not confirm trade execution (No fill). Aborting entry."); return
+
+                # Update size to actual filled size in case of partial fill
+                if filled_qty != self.trade_size_in_asset:
+                     self.logger.info(f"Adjusting position size from {self.trade_size_in_asset} to filled amount: {filled_qty}")
+                     self.trade_size_in_asset = filled_qty
 
                 self.in_position, self.position_type, self.entry_price = True, signal, confirmed_price
                 self.entry_time = datetime.now(timezone.utc)
@@ -365,15 +392,19 @@ class Trader:
             else:
                 self.logger.info("Placing MARKET order for immediate exit.")
                 order = self.exchange.create_market_order(self.symbol, 'sell' if self.position_type == 'LONG' else 'buy', float(formatted_amount), params=order_params)
-            confirmed_exit_price = self._await_order_fill(order['id'], order_type)
-            if confirmed_exit_price is None:
+            
+            filled_qty, confirmed_exit_price = self._await_order_fill(order['id'], order_type)
+            
+            if filled_qty == 0 or confirmed_exit_price is None:
                 self.logger.error(f"Could not confirm exit for order {order['id']}. Position may still be open.")
                 if order_type == 'limit': return
                 return
+            
             exit_time = datetime.now(timezone.utc)
-            pnl = ((confirmed_exit_price - self.entry_price) if self.position_type == 'LONG' else (self.entry_price - confirmed_exit_price)) * self.trade_size_in_asset
+            # Use actual filled_qty for PnL calculation
+            pnl = ((confirmed_exit_price - self.entry_price) if self.position_type == 'LONG' else (self.entry_price - confirmed_exit_price)) * filled_qty
             self.logger.info(f"--- POSITION CLOSED --- PnL: ${pnl:.2f}")
-            trade_record = {'trader_id': self.trader_id, 'instance_id': self.instance_id, 'exchange': self.exchange_id, 'symbol': self.symbol, 'position_type': self.position_type, 'entry_price': self.entry_price, 'exit_price': confirmed_exit_price, 'entry_time': self.entry_time, 'exit_time': exit_time, 'trade_size': self.trade_size_in_asset, 'pnl': pnl, 'exit_reason': exit_reason}
+            trade_record = {'trader_id': self.trader_id, 'instance_id': self.instance_id, 'exchange': self.exchange_id, 'symbol': self.symbol, 'position_type': self.position_type, 'entry_price': self.entry_price, 'exit_price': confirmed_exit_price, 'entry_time': self.entry_time, 'exit_time': exit_time, 'trade_size': filled_qty, 'pnl': pnl, 'exit_reason': exit_reason}
             self.state_manager.save_trade_history(trade_record)
             self.in_position, self.position_type, self.entry_price, self.trade_size_in_asset, self.entry_time = False, None, 0, 0, None
             self.stop_loss_price, self.take_profit_price = None, None

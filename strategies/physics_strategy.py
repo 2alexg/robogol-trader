@@ -17,6 +17,10 @@ class PhysicsStrategy(MLStrategy):
     def __init__(self, params):
         super().__init__(params)
         self.features = ['velocity', 'acceleration', 'rsi', 'z_score', 'pct_b', 'atr_pct', 'adx']
+        
+        # Load ATR multipliers from config, defaulting to 2.0 to match massive_backtest_engine.py
+        self.atr_sl_multiplier = float(params.get('atr_sl_multiplier', 2.0))
+        self.atr_tp_multiplier = float(params.get('atr_tp_multiplier', 2.0))
 
     def add_features(self, df):
         df = df.copy()
@@ -50,6 +54,7 @@ class PhysicsStrategy(MLStrategy):
         df['tr1'] = abs(df['high'] - df['close'].shift())
         df['tr2'] = abs(df['low'] - df['close'].shift())
         df['tr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
+        # Using rolling 20 period to match original file
         df['atr'] = df['tr'].rolling(20).mean()
         df['atr_pct'] = df['atr'] / df['close']
 
@@ -69,3 +74,26 @@ class PhysicsStrategy(MLStrategy):
 
         df.dropna(inplace=True)
         return df
+
+    def calculate_exit_prices(self, entry_price, signal, current_row):
+        """
+        Calculates Stop Loss and Take Profit based on the ATR value
+        from the current row, using the multipliers from config.
+        """
+        atr = current_row.get('atr', 0)
+        
+        # Fallback if ATR is missing or zero (should be rare if add_features ran)
+        if atr <= 0:
+            # Fallback to a small percentage if ATR fails, or raise error
+            atr = entry_price * 0.01 
+
+        if signal == 'LONG':
+            stop_loss = entry_price - (atr * self.atr_sl_multiplier)
+            take_profit = entry_price + (atr * self.atr_tp_multiplier)
+        elif signal == 'SHORT':
+            stop_loss = entry_price + (atr * self.atr_sl_multiplier)
+            take_profit = entry_price - (atr * self.atr_tp_multiplier)
+        else:
+            return None, None
+            
+        return stop_loss, take_profit

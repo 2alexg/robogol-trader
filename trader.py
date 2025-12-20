@@ -115,6 +115,13 @@ class Trader:
         self.load_and_set_initial_state()
         self.timeframe_in_ms = self.exchange.parse_timeframe(self.timeframe) * 1000
 
+        # --- NEW: Model Hot-Reload Tracking ---
+        self.model_path = config['parameters'].get('model_path')
+        self.last_model_mtime = 0
+        if self.model_path and os.path.exists(self.model_path):
+            self.last_model_mtime = os.path.getmtime(self.model_path)
+            self.logger.info(f"Monitoring model file for updates: {self.model_path}")
+        
     def load_market_data(self):
         try:
             self.logger.info(f"Loading market data for {self.symbol} on {self.exchange_id}...")
@@ -171,6 +178,8 @@ class Trader:
             self.logger.info("--- Starting Live Trading Engine ---"); self.control_checker.start()
             if self.last_candle_timestamp is None: self.update_latest_closed_candle_data()
             while True:
+                # --- NEW: Check for model update at the start of every loop ---
+                self.check_for_model_update()
                 if self.in_position: self.run_intra_candle_checks()
                 else: self.sleep_until_next_candle()
                 self.update_latest_closed_candle_data()
@@ -179,6 +188,29 @@ class Trader:
         except Exception as e: self.logger.error(f"Unexpected critical error: {e}. Shutting down.", exc_info=True)
         finally:
             self.control_checker.stop(); self.lock_manager.release()
+    def check_for_model_update(self):
+        """
+        Checks if the model pickle file has been modified.
+        If so, re-initializes the strategy to load the new brain.
+        """
+        if not self.model_path or not os.path.exists(self.model_path):
+            return
+
+        try:
+            current_mtime = os.path.getmtime(self.model_path)
+            if current_mtime > self.last_model_mtime:
+                self.logger.info(f"!!! NEW MODEL DETECTED (mtime: {current_mtime}) !!!")
+                self.logger.info("Reloading strategy to activate new brain...")
+                
+                # Re-load the strategy class and re-instantiate
+                # This automatically calls joblib.load() in the strategy's __init__
+                StrategyClass = load_strategy_class(strategy_name=self.config['strategy_name'])
+                self.strategy = StrategyClass(self.config['parameters'])
+                
+                self.last_model_mtime = current_mtime
+                self.logger.info(">>> Strategy Reloaded Successfully. Trading with NEW MODEL. <<<")
+        except Exception as e:
+            self.logger.error(f"Failed to reload model: {e}")
     def run_intra_candle_checks(self):
         next_candle_time = self.last_candle_timestamp + timedelta(milliseconds=self.timeframe_in_ms)
         self.logger.info(f"In position. Monitoring until {next_candle_time:%H:%M:%S %Z}.")

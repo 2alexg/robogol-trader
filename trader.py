@@ -5,9 +5,11 @@
 # execution engine. This version delegates exit price calculations
 # to the strategy and includes a 'Paper Trading' mode for simulation.
 #
+# UPDATED: Added 'signal_mode' support to handle "Perfect Loser" strategies
+# by reversing signals (Normal <-> Reverse).
+#
 # Author: Gemini
-# Date: 2025-11-17 (Strategy-Aware Exits)
-# Updated: 2025-12-19 (Partial Fill Handling & Paper Trading Mode)
+# Date: 2025-12-20
 
 import ccxt
 import pandas as pd
@@ -66,6 +68,10 @@ class Trader:
         self.logger = logger
         self.paper_trading = config.get('paper_trading', False)
         
+        # --- NEW: Signal Mode (Normal vs Reverse) ---
+        # Default is 'normal'. Use 'reverse' to profit from "Perfect Loser" strategies.
+        self.signal_mode = config.get('signal_mode', 'normal').lower()
+
         # --- Check for multi-timeframe requirement ---
         self.high_timeframe = config.get('high_timeframe')
         self.high_tf_df = None # Will hold the high-timeframe data
@@ -75,6 +81,10 @@ class Trader:
         if self.paper_trading: self.trader_id += "_PAPER"
         
         self.logger.info(f"Initializing trader with ID: {self.trader_id}")
+        
+        if self.signal_mode == 'reverse':
+             self.logger.info("!!! REVERSE MODE ACTIVE: ALL SIGNALS WILL BE INVERTED !!!")
+        
         if self.paper_trading:
             self.logger.info("!!! RUNNING IN PAPER TRADING MODE - NO REAL ORDERS WILL BE EXECUTED !!!")
 
@@ -85,7 +95,7 @@ class Trader:
         self.lock_manager = MongoLockManager(db_client, self.trader_id, self.instance_id, self.logger)
         self.state_manager = MongoStateManager(db_client, self.trader_id, self.logger)
         self.settings_collection = db_client[main_config.MONGO_DB_NAME]['trader_settings']
-        self.trade_size_usd = DEFAULT_TRADE_SIZE_USD
+        self.trade_size_usd = config.get('trade_size_usd', DEFAULT_TRADE_SIZE_USD)
         self.max_position_size_usd = config.get('max_position_size_usd', self.trade_size_usd)
         self.operational_mode = 'trading'
         self.control_checker = ControlSignalChecker(db_client, self.trader_id, self, self.logger)
@@ -320,6 +330,14 @@ class Trader:
             self.logger.info(f"Mode is '{self.operational_mode}', skipping entry check."); return
         
         signal = self.strategy.get_entry_signal(prev_row, current_row)
+
+        # --- NEW: Reverse Signal Logic ---
+        # If signal_mode is 'reverse', we flip the signal BEFORE proceeding.
+        if signal and self.signal_mode == 'reverse':
+            original_signal = signal
+            if signal == 'LONG': signal = 'SHORT'
+            elif signal == 'SHORT': signal = 'LONG'
+            self.logger.info(f"Reverse Mode: Inverted {original_signal} signal to {signal}.")
         
         if signal:
             # --- NEW: Pyramiding Checks ---
@@ -393,6 +411,7 @@ class Trader:
                 
                 # --- CRITICAL: Update SL/TP for the WHOLE position ---
                 # We recalculate SL/TP based on the NEW Average Entry Price and CURRENT volatility.
+                # Note: 'signal' here is already reversed if needed, so SL/TP will be calculated correctly for the new direction.
                 self.stop_loss_price, self.take_profit_price = self.strategy.calculate_exit_prices(
                     entry_price=self.entry_price, 
                     signal=signal, 

@@ -86,6 +86,7 @@ class Trader:
         self.state_manager = MongoStateManager(db_client, self.trader_id, self.logger)
         self.settings_collection = db_client[main_config.MONGO_DB_NAME]['trader_settings']
         self.trade_size_usd = DEFAULT_TRADE_SIZE_USD
+        self.max_position_size_usd = config.get('max_position_size_usd', self.trade_size_usd)
         self.operational_mode = 'trading'
         self.control_checker = ControlSignalChecker(db_client, self.trader_id, self, self.logger)
         try:
@@ -239,11 +240,21 @@ class Trader:
             
         df_with_indicators.dropna(inplace=True);
         if df_with_indicators.empty: return
+
         prev_row, current_row = df_with_indicators.iloc[-2], df_with_indicators.iloc[-1]
-        if self.in_position: self.check_for_candle_close_exit(current_row)
-        if not self.in_position:
+
+        # 1. Check for Exits (Always check this first)
+        if self.in_position:
+            self.check_for_candle_close_exit(current_row)
+        # 2. Check for Entries (Modified)
+        # Logic: Check for entry if we are NOT in position OR if we have room to add
+        current_value = self.trade_size_in_asset * current_row['close']
+        can_add_to_position = self.in_position and (current_value < self.max_position_size_usd)
+        
+        if (not self.in_position or can_add_to_position):
             signal_age = (datetime.now(timezone.utc) - current_row.name).total_seconds()
-            if signal_age <= TRADE_ENTRY_WINDOW_S: self.check_for_entry(prev_row, current_row)
+            if signal_age <= TRADE_ENTRY_WINDOW_S:
+                self.check_for_entry(prev_row, current_row)
 
     def _await_order_fill(self, order_id, order_type):
         """
@@ -311,6 +322,24 @@ class Trader:
         signal = self.strategy.get_entry_signal(prev_row, current_row)
         
         if signal:
+            # --- NEW: Pyramiding Checks ---
+            if self.in_position:
+                # 1. Direction Check: Only add if signal matches current position
+                if signal != self.position_type:
+                    self.logger.info(f"Ignored {signal} signal because we are currently {self.position_type}.")
+                    return
+                
+                # 2. Cap Check: Ensure we don't exceed max size
+                current_price = current_row['close']
+                current_exposure = self.trade_size_in_asset * current_price
+                
+                # If adding one more trade exceeds max, abort (or you could adjust size to fill remainder)
+                if current_exposure + self.trade_size_usd > self.max_position_size_usd:
+                    self.logger.info("Max position size reached. Skipping pyramiding entry.")
+                    return
+
+                self.logger.info(f"Pyramiding: Adding to {self.position_type} position. Current Size: ${current_exposure:.2f}")
+
             self.logger.info(f"!!! ENTRY SIGNAL DETECTED: {signal} !!!")
             try:
                 signal_price = current_row['close']
@@ -341,28 +370,45 @@ class Trader:
                 if filled_qty == 0 or confirmed_price is None:
                     self.logger.error("Could not confirm trade execution (No fill). Aborting entry."); return
 
-                # Update size to actual filled size in case of partial fill
-                if filled_qty != self.trade_size_in_asset:
-                     self.logger.info(f"Adjusting position size from {self.trade_size_in_asset} to filled amount: {filled_qty}")
-                     self.trade_size_in_asset = filled_qty
+                new_position = False
+                if self.in_position:
+                    # Recalculate Weighted Average Entry Price
+                    total_cost_old = self.trade_size_in_asset * self.entry_price
+                    total_cost_new = filled_qty * confirmed_price
+                    new_total_qty = self.trade_size_in_asset + filled_qty
 
-                self.in_position, self.position_type, self.entry_price = True, signal, confirmed_price
-                self.entry_time = datetime.now(timezone.utc)
+                    self.entry_price = (total_cost_old + total_cost_new) / new_total_qty
+                    self.trade_size_in_asset = new_total_qty
+
+                    self.logger.info(f"Position Increased. New Avg Entry: {self.entry_price:.4f}, Total Size: {self.trade_size_in_asset}")
+                else:
+                    # Update size to actual filled size in case of partial fill
+                    if filled_qty != self.trade_size_in_asset:
+                        self.logger.info(f"Adjusting position size from {self.trade_size_in_asset} to filled amount: {filled_qty}")
+                    # Standard New Position
+                    self.in_position, self.position_type, self.entry_price = True, signal, confirmed_price
+                    self.trade_size_in_asset = filled_qty
+                    self.entry_time = datetime.now(timezone.utc)
+                    new_position = True
                 
-                # --- FIX: Delegate SL/TP calculation to the strategy ---
-                # This is the key change allowing strategies to use custom logic like ATR
+                # --- CRITICAL: Update SL/TP for the WHOLE position ---
+                # We recalculate SL/TP based on the NEW Average Entry Price and CURRENT volatility.
                 self.stop_loss_price, self.take_profit_price = self.strategy.calculate_exit_prices(
-                    entry_price=confirmed_price, 
+                    entry_price=self.entry_price, 
                     signal=signal, 
                     current_row=current_row
                 )
-                # --- End of FIX ---
 
                 self.logger.info(f"--- TRADE CONFIRMED --- New Position: {self.position_type} @ {self.entry_price}")
-                self.logger.info(f"SL: {self.stop_loss_price:.{self.price_decimal_places}f}, TP: {self.take_profit_price:.{self.price_decimal_places}f}")
+                if new_position:
+                    self.logger.info(f"SL: {self.stop_loss_price:.{self.price_decimal_places}f}, TP: {self.take_profit_price:.{self.price_decimal_places}f}")
+                else:
+                    self.logger.info(f"SL/TP Updated: SL: {self.stop_loss_price:.{self.price_decimal_places}f}, TP: {self.take_profit_price:.{self.price_decimal_places}f}")
                 self.state_manager.save_state(self.get_current_state_dict())
-            except Exception as e: self.logger.error(f"Error placing order: {e}", exc_info=True); self.in_position = False
-            
+            except Exception as e:
+                self.logger.error(f"Error placing order: {e}", exc_info=True)
+                # Handle rollback if needed (simplest is to just not update state if order failed)            
+
     def check_for_candle_close_exit(self, current_row):
         if not self.in_position: return
         exit_reason = None; current_price = current_row['close']

@@ -48,7 +48,7 @@ WINDOW_SIZE = VAL_LEN + TRAIN_LEN
 # 1. DATABASE & LOGGING
 # ==========================================
 class TradeLogger:
-    def __init__(self, uri, db_name):
+    def __init__(self, uri, db_name, strategy_name):
         self.client = MongoClient(uri)
         self.db = self.client[db_name]
         self.trades = self.db['backtest_trades']
@@ -66,7 +66,8 @@ class TradeLogger:
             "config": {
                 "train_len": TRAIN_LEN,
                 "symbols": SYMBOLS,
-                "timeframes": TIMEFRAMES
+                "timeframes": TIMEFRAMES,
+                "strategy": strategy_name
             },
             "status": "running"
         })
@@ -151,7 +152,7 @@ def train_and_get_threshold(X_train_full, y_train_full, target_precision=0.70):
 # ==========================================
 # 3. SIMULATION & LOGGING ENGINE (THE NEW PART)
 # ==========================================
-def simulate_and_log(symbol, timeframe, preds, df_buffer, side, atr_mult=2.0):
+def simulate_and_log(symbol, timeframe, preds, df_buffer, side, strategy_name, atr_mult=2.0):
     """
     Looks forward to find EXACT Exit Time for log.
     df_buffer: Contains [TEST_LEN + HORIZON] rows to allow looking ahead.
@@ -235,6 +236,7 @@ def simulate_and_log(symbol, timeframe, preds, df_buffer, side, atr_mult=2.0):
             # Construct Log Object
             trade_doc = {
                 "run_id": RUN_ID,
+                "strategy": strategy_name,
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "side": side,
@@ -254,10 +256,11 @@ def simulate_and_log(symbol, timeframe, preds, df_buffer, side, atr_mult=2.0):
 # 4. MAIN LOOP
 # ==========================================
 def main():
-    logger = TradeLogger(MONGO_URI, LOG_DB_NAME)
+    SELECTED_STRATEGY = "Physics" # Change this string to switch brains!
+
+    logger = TradeLogger(MONGO_URI, LOG_DB_NAME, SELECTED_STRATEGY)
     repo = MongoClient(MONGO_URI)[DB_NAME] # Direct access for loading data
 
-    SELECTED_STRATEGY = "Physics" # Change this string to switch brains!
     StrategyClass = STRATEGY_MAP[SELECTED_STRATEGY]
 
     strategy_instance = StrategyClass({'model_path': None})
@@ -323,8 +326,8 @@ def main():
                 preds_l = (model_l.predict_proba(X_sim)[:, 1] >= t_l).astype(int) if active_l else np.zeros(len(X_sim))
                 
                 # Simulate & Log
-                trades_s = simulate_and_log(symbol, timeframe, preds_s, df_buffer, 'short')
-                trades_l = simulate_and_log(symbol, timeframe, preds_l, df_buffer, 'long')
+                trades_s = simulate_and_log(symbol, timeframe, preds_s, df_buffer, 'short', SELECTED_STRATEGY)
+                trades_l = simulate_and_log(symbol, timeframe, preds_l, df_buffer, 'long', SELECTED_STRATEGY)
                 
                 # Batch Insert to Mongo
                 all_trades = trades_s + trades_l

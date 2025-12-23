@@ -65,6 +65,19 @@ def get_labels(df, side='short', sl_mult=2.0, tp_mult=2.0, horizon=100):
 
 # --- 2. Training Function ---
 def train_model(X, y, target_precision=0.70):
+    # Safety Check: GBC requires at least 2 classes.
+    if len(np.unique(y)) < 2:
+        print("    Warning: Only one class in targets. Cannot train. Model will be INACTIVE (Threshold=2.0).")
+        # We assume X is valid. We fit on dummy data to avoid crash, but set threshold high.
+        # Note: This fitted model won't actually be used because threshold is 2.0.
+        # But we need a valid object for pickle.
+        # We'll create a dummy fit.
+        dummy_y = np.array([0, 1] * (len(y) // 2 + 1))[:len(y)] 
+        weights = np.ones(len(y))
+        model = GradientBoostingClassifier(n_estimators=1, max_depth=1, random_state=42)
+        model.fit(X, dummy_y) 
+        return model, 2.0
+
     weights = compute_sample_weight(class_weight='balanced', y=y)
     model = GradientBoostingClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42)
     model.fit(X, y, sample_weight=weights)
@@ -73,7 +86,7 @@ def train_model(X, y, target_precision=0.70):
     probs = model.predict_proba(X)[:, 1]
     precisions, recalls, thresholds = precision_recall_curve(y, probs)
     
-    optimal_threshold = 0.85 # Default fallback
+    optimal_threshold = 2.0 # Default to unreachable (inactive) to prevent bad trades
     found_threshold = False
     
     for p, t in zip(precisions[:-1], thresholds):
@@ -83,7 +96,7 @@ def train_model(X, y, target_precision=0.70):
             break
     
     if not found_threshold:
-        print(f"    Warning: Could not reach {target_precision} precision. Using best available.")
+        print(f"    Warning: Could not reach {target_precision} precision. Model will be INACTIVE (Threshold=2.0).")
             
     return model, optimal_threshold
 

@@ -4,7 +4,7 @@
 PROJECT_DIR="/home/alexgol/Projects/robogol-trader"
 WORK_DIR="/home/alexgol/ML_Models"
 VENV_PATH="/home/alexgol/python/venv"
-LOG_FILE="$WORK_DIR/weekly_retrain.log"
+LOG_FILE="$WORK_DIR/daily_3_retrain.log"
 
 # Navigate to project
 cd "$PROJECT_DIR" || exit 1
@@ -64,62 +64,17 @@ train_and_deploy() {
 
 # Syntax: train_and_deploy "SYMBOL" "TIMEFRAME" "STRATEGY" LIMIT "OUTPUT_FILE"
 
-# 1. 1H AVAX Model (Physics)
-train_and_deploy "AVAX/USDT" "1h" "Physics" 10000 "physics_1h_avax.pkl"
-
-# 2. 15M APT Model (Physics)
+# 1. 15M APT Model (Physics)
 train_and_deploy "APT/USDT" "15m" "Physics" 10000 "physics_15m_apt.pkl"
 
-# 3. 15M AVAX Model (Physics)
+# 2. 15M AVAX Model (Physics)
 train_and_deploy "AVAX/USDT" "15m" "Physics" 10000 "physics_15m_avax.pkl"
 
-# 4. 15M ETH Model (Physics)
+# 3. 15M ETH Model (Physics)
 train_and_deploy "ETH/USDT" "15m" "Physics" 10000 "physics_15m_eth.pkl"
 
-# 5. 15M POL Model (Physics)
+# 4. 15M POL Model (Physics)
 train_and_deploy "POL/USDT" "15m" "Physics" 10000 "physics_15m_pol.pkl"
-
-# 6. 5M BTC Model (Physics)
-train_and_deploy "BTC/USDT" "5m" "Physics" 10000 "physics_5m_btc.pkl"
-
-# 7. 5M ETH Model (Physics)
-train_and_deploy "ETH/USDT" "5m" "Physics" 10000 "physics_5m_eth.pkl"
-
-# 8. 5M LINK Model (Physics)
-train_and_deploy "LINK/USDT" "5m" "Physics" 10000 "physics_5m_link.pkl"
-
-# 9. 5M TRX Model (Physics)
-train_and_deploy "TRX/USDT" "5m" "Physics" 10000 "physics_5m_trx.pkl"
-
-# 10. 1H ADA Model (VWAP)
-train_and_deploy "ADA/USDT" "1h" "Vwap" 10000 "vwap_1h_ada.pkl"
-
-# 11. 1H AVAX Model (VWAP)
-train_and_deploy "AVAX/USDT" "1h" "Vwap" 10000 "vwap_1h_avax.pkl"
-
-# 12. 1H ETH Model (VWAP)
-train_and_deploy "ETH/USDT" "1h" "Vwap" 10000 "vwap_1h_eth.pkl"
-
-# 13. 1H LINK Model (VWAP)
-train_and_deploy "LINK/USDT" "1h" "Vwap" 10000 "vwap_1h_link.pkl"
-
-# 14. 5M BTC Model (VWAP)
-train_and_deploy "BTC/USDT" "5m" "Vwap" 10000 "vwap_5m_btc.pkl"
-
-# 15. 5M ETH Model (VWAP)
-train_and_deploy "ETH/USDT" "5m" "Vwap" 10000 "vwap_5m_eth.pkl"
-
-# 16. 5M TRX Model (VWAP)
-train_and_deploy "TRX/USDT" "5m" "Vwap" 10000 "vwap_5m_trx.pkl"
-
-# 17. 5M UNI Model (VWAP)
-train_and_deploy "UNI/USDT" "5m" "Vwap" 10000 "vwap_5m_uni.pkl"
-
-# 18. 5M XRP Model (VWAP)
-train_and_deploy "XRP/USDT" "5m" "Vwap" 10000 "vwap_5m_xrp.pkl"
-
-# 19. 5M ZEC Model (VWAP)
-train_and_deploy "ZEC/USDT" "5m" "Vwap" 10000 "vwap_5m_zec.pkl"
 
 echo "--- [$(date)] Cycle Complete ---" >> "$LOG_FILE"
 echo "========================================================" >> "$LOG_FILE"

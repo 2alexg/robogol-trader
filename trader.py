@@ -402,14 +402,13 @@ class Trader:
                 if final_amount_in_asset > desired_amount_in_asset: self.logger.info(f"Size adjusted up to meet exchange minimum.")
                 quantity_in_contracts = final_amount_in_asset / self.contract_size
                 formatted_amount = self.exchange.amount_to_precision(self.symbol, quantity_in_contracts)
-                self.trade_size_in_asset = final_amount_in_asset
-                self.logger.info(f"Calculated final order: {formatted_amount} contracts (True Size: {self.trade_size_in_asset:.8f})")
+                self.logger.info(f"Calculated final order: {formatted_amount} contracts (True Size: {final_amount_in_asset:.8f})")
                 
                 if self.paper_trading:
                     # --- PAPER TRADING SIMULATION ---
                     self.logger.info(f"PAPER TRADING: Simulating ENTRY order of {formatted_amount} contracts at {limit_price}...")
-                    filled_qty = self.trade_size_in_asset # Assume full fill
-                    confirmed_price = float(limit_price)  # Assume fill at limit price
+                    filled_qty = final_amount_in_asset   # Assume full fill
+                    confirmed_price = float(limit_price) # Assume fill at limit price
                 else:
                     # --- REAL TRADING EXECUTION ---
                     order_params = {};

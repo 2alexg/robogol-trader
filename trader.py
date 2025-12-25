@@ -127,6 +127,7 @@ class Trader:
             self.logger.info(f"Loading market data for {self.symbol} on {self.exchange_id}...")
             self.exchange.load_markets()
             market = self.exchange.market(self.symbol)
+
             price_precision_value = market['precision']['price']
             if isinstance(price_precision_value, int):
                 self.price_decimal_places = price_precision_value
@@ -137,8 +138,21 @@ class Trader:
             else:
                 self.tick_size = 0.0001; self.price_decimal_places = 4
                 self.logger.warning("Could not determine price precision method. Using safe defaults.")
-            min_trade_amount_in_contracts = market['limits']['amount']['min']
-            self.contract_size = market.get('contractSize', 1.0)
+
+            min_amount = market.get('limits', {}).get('amount', {}).get('min')
+            if min_amount is None:
+                self.logger.warning(f"Market 'min' limit is None. Defaulting min trade size to 0.0.")
+                min_trade_amount_in_contracts = 0.0
+            else:
+                min_trade_amount_in_contracts = float(min_amount)
+
+            c_size = market.get('contractSize')
+            if c_size is None:
+                self.logger.info(f"Contract size not specified or None. Defaulting to 1.0.")
+                self.contract_size = 1.0
+            else:
+                self.contract_size = float(c_size)
+
             self.min_trade_amount_in_asset = min_trade_amount_in_contracts * self.contract_size
             self.logger.info(f"Market data loaded: Min Asset Size={self.min_trade_amount_in_asset}, Tick Size={self.tick_size}, Price Decimals={self.price_decimal_places}, Contract Size={self.contract_size}")
         except Exception as e:
@@ -162,16 +176,6 @@ class Trader:
         return { 'in_position': self.in_position, 'position_type': self.position_type, 'entry_price': self.entry_price, 
                  'trade_size_in_asset': self.trade_size_in_asset, 'last_candle_timestamp': self.last_candle_timestamp, 
                  'entry_time': self.entry_time, 'stop_loss_price': self.stop_loss_price, 'take_profit_price': self.take_profit_price }
-    def load_dynamic_settings(self):
-        try:
-            settings_doc = self.settings_collection.find_one({'_id': self.trader_id})
-            if settings_doc and 'trade_size_usd' in settings_doc:
-                new_size = float(settings_doc['trade_size_usd'])
-                if new_size != self.trade_size_usd:
-                    self.logger.info(f"SETTINGS UPDATE: Trade size changed to ${new_size}."); self.trade_size_usd = new_size
-            elif self.trade_size_usd != DEFAULT_TRADE_SIZE_USD:
-                self.logger.info(f"SETTINGS UPDATE: Reverting to default ${DEFAULT_TRADE_SIZE_USD}."); self.trade_size_usd = DEFAULT_TRADE_SIZE_USD
-        except Exception as e: self.logger.error(f"Could not load dynamic settings: {e}")
     def run(self):
         if not self.lock_manager.acquire(): sys.exit(1)
         try:
@@ -225,7 +229,6 @@ class Trader:
     
     def update_latest_closed_candle_data(self):
         if not self.lock_manager.verify(): raise LockLostError()
-        self.load_dynamic_settings()
         
         # Fetch high-timeframe data if needed
         if self.high_timeframe:

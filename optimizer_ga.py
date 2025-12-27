@@ -92,6 +92,9 @@ def load_config_from_file(file_path):
         print(f"Error loading config file '{file_path}': {e}", file=sys.stderr)
         sys.exit(1)
 
+def get_timestamp_str():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 # --- DATABASE LOGGING ---
 
 class TradeLogger:
@@ -119,7 +122,7 @@ class TradeLogger:
             },
             "status": "running"
         })
-        print(f"--- LOGGING STARTED (Run ID: {RUN_ID}) ---")
+        print(f"[{get_timestamp_str()}] --- LOGGING STARTED (Run ID: {RUN_ID}) ---")
         print(f"    Target DB: '{db_name}'")
 
     def log_trades(self, trade_list):
@@ -373,12 +376,12 @@ def run_rolling_optimization(ga_config):
     # 4. Main Loops
     for symbol in SYMBOLS:
         for timeframe in TIMEFRAMES:
-            print(f"\n=== Processing {symbol} {timeframe} ===")
+            print(f"\n[{get_timestamp_str()}] === Processing {symbol} {timeframe} ===")
 
             # Get Full Data
             df_full = data_manager.get_data(symbol, timeframe)
             if df_full is None or len(df_full) < (TRAIN_LEN + TEST_LEN):
-                print(f"  Not enough data for {symbol} {timeframe}. Skipping.")
+                print(f"  [{get_timestamp_str()}] Not enough data for {symbol} {timeframe}. Skipping.")
                 continue
 
             # Rolling Window Loop
@@ -425,7 +428,7 @@ def run_rolling_optimization(ga_config):
 
                 # --- B. SIMULATION PHASE (ON TEST WINDOW) ---
                 if train_wr >= MIN_TRAIN_PRECISION:
-                    print(f"  [{current_date}] Train WR: {train_wr:.1f}% | PnL: ${train_pnl:.0f} -> DEPLOYING params.")
+                    print(f"  [{get_timestamp_str()}] [{test_min_date}] Train WR: {train_wr:.1f}% | PnL: ${train_pnl:.0f} -> DEPLOYING params.")
 
                     # Simulate on Test Data
                     # Note: We pass min_date so trades are logged only for the TEST_LEN window
@@ -439,10 +442,10 @@ def run_rolling_optimization(ga_config):
                     else:
                         print("     > No trades triggered in test window.")
                 else:
-                    print(f"  [{current_date}] Train WR: {train_wr:.1f}% (Low) -> SKIPPING deployment.")
+                    print(f"  [{get_timestamp_str()}] [{test_min_date}] Train WR: {train_wr:.1f}% (Low) -> SKIPPING deployment.")
 
     logger.finish_run(total_portfolio_pnl)
-    print(f"\nDONE. Run ID: {RUN_ID}")
+    print(f"\n[{get_timestamp_str()}] DONE. Run ID: {RUN_ID}")
     print(f"Total Simulated PnL: ${total_portfolio_pnl:.2f}")
 
 if __name__ == "__main__":

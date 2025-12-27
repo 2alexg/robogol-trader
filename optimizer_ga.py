@@ -47,6 +47,7 @@ from data_manager import DataManager
 LOG_DB_NAME = "backtest_logs" # Separate DB for simulation results
 TRAIN_LEN = 10000      # Size of the optimization window
 TEST_LEN = 1000        # Size of the forward test/simulation window
+WARMUP_LEN = 500       # Size of the warmup period for indicators
 WINDOW_SIZE = TRAIN_LEN
 MIN_TRAIN_PRECISION = 50.0  # Min Win Rate (%) in training to justify trading the test window
 
@@ -112,6 +113,7 @@ class TradeLogger:
             "config": {
                 "train_len": TRAIN_LEN,
                 "test_len": TEST_LEN,
+                "warmup_len": WARMUP_LEN,
                 "symbols": SYMBOLS,
                 "timeframes": TIMEFRAMES
             },
@@ -164,13 +166,18 @@ def run_strategy_logic(df, strategy_class, params):
     df_processed.dropna(inplace=True)
     return strategy, df_processed
 
-def evaluate_fitness(individual, strategy_class, df_train, param_keys):
+def evaluate_fitness(individual, strategy_class, df_train, param_keys, min_date):
     """
     Fitness function for GA. Returns PnL of the Training Window.
     """
     params = dict(zip(param_keys, individual))
 
     strategy, df = run_strategy_logic(df_train, strategy_class, params)
+
+    # Filter out warmup data so we evaluate only on the intended window
+    if df is not None and not df.empty:
+        df = df[df.index >= min_date]
+
     if strategy is None or df is None or df.empty:
         return (-9999.0,) # High penalty
 
@@ -215,7 +222,7 @@ def evaluate_fitness(individual, strategy_class, df_train, param_keys):
     net_pnl = capital - INITIAL_CAPITAL
     return (net_pnl,)
 
-def simulate_and_get_trades(best_params, strategy_class, df_test, symbol, timeframe, is_training=False):
+def simulate_and_get_trades(best_params, strategy_class, df_test, symbol, timeframe, is_training=False, min_date=None):
     """
     Runs the simulation on the Test Window (or Train Window if is_training=True)
     Returns:
@@ -223,6 +230,10 @@ def simulate_and_get_trades(best_params, strategy_class, df_test, symbol, timefr
        if is_training=False: List of trade dictionaries for logging
     """
     strategy, df = run_strategy_logic(df_test, strategy_class, best_params)
+
+    # Filter out warmup data so we evaluate only on the intended window
+    if df is not None and not df.empty and min_date is not None:
+        df = df[df.index >= min_date]
 
     if strategy is None or df is None or df.empty:
         return (0, 0) if is_training else []
@@ -378,14 +389,24 @@ def run_rolling_optimization(ga_config):
                 train_end = start_idx + TRAIN_LEN
                 test_end = train_end + TEST_LEN
 
-                # Define Slices
-                df_train = df_full.iloc[start_idx : train_end].copy()
-                df_test = df_full.iloc[train_end : test_end].copy()
+                # Define Slices with Warmup
+                # Train Slice: Include WARMUP_LEN candles before start_idx (if available)
+                train_start_with_warmup = max(0, start_idx - WARMUP_LEN)
+                df_train = df_full.iloc[train_start_with_warmup : train_end].copy()
+
+                # Test Slice: Include WARMUP_LEN candles before train_end (start of test)
+                test_start_with_warmup = max(0, train_end - WARMUP_LEN)
+                df_test = df_full.iloc[test_start_with_warmup : test_end].copy()
+
+                # Determine Cutoff Dates (The actual start of evaluation)
+                # These timestamps mark where the real window begins, excluding warmup
+                train_min_date = df_full.index[start_idx]
+                test_min_date = df_full.index[train_end]
 
                 # --- A. OPTIMIZATION PHASE (ON TRAIN WINDOW) ---
-                # Register evaluate with the current df_train
+                # Register evaluate with the current df_train and the train_min_date cutoff
                 toolbox.register("evaluate", evaluate_fitness, strategy_class=strategy_class,
-                                 df_train=df_train, param_keys=param_keys)
+                                 df_train=df_train, param_keys=param_keys, min_date=train_min_date)
 
                 # Run GA
                 pop = toolbox.population(n=POPULATION_SIZE)
@@ -397,15 +418,18 @@ def run_rolling_optimization(ga_config):
                 best_params = dict(zip(param_keys, top_ind))
 
                 # Validation: Check Precision/WinRate on Train Data
-                train_wr, train_pnl = simulate_and_get_trades(best_params, strategy_class, df_train, symbol, timeframe, is_training=True)
+                # Note: We pass min_date so metrics are calculated only on the TRAIN_LEN window
+                train_wr, train_pnl = simulate_and_get_trades(best_params, strategy_class, df_train, symbol, timeframe, is_training=True, min_date=train_min_date)
 
-                current_date = df_test.index[0]
+                current_date = df_test.index[0] # This might be inside warmup, but it's just for display label
 
                 # --- B. SIMULATION PHASE (ON TEST WINDOW) ---
                 if train_wr >= MIN_TRAIN_PRECISION:
                     print(f"  [{current_date}] Train WR: {train_wr:.1f}% | PnL: ${train_pnl:.0f} -> DEPLOYING params.")
 
-                    trades = simulate_and_get_trades(best_params, strategy_class, df_test, symbol, timeframe, is_training=False)
+                    # Simulate on Test Data
+                    # Note: We pass min_date so trades are logged only for the TEST_LEN window
+                    trades = simulate_and_get_trades(best_params, strategy_class, df_test, symbol, timeframe, is_training=False, min_date=test_min_date)
 
                     if trades:
                         logger.log_trades(trades)

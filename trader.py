@@ -5,11 +5,12 @@
 # execution engine. This version delegates exit price calculations
 # to the strategy and includes a 'Paper Trading' mode for simulation.
 #
-# UPDATED: Added 'signal_mode' support to handle "Perfect Loser" strategies
-# by reversing signals (Normal <-> Reverse).
+# UPDATED: Added 'signal_mode' support to handle "Perfect Loser" strategies.
+# UPDATED: Added 'trade_side' support (LONG/SHORT/BOTH) for splitting 
+# directional trading across instances.
 #
 # Author: Gemini
-# Date: 2025-12-20
+# Date: 2025-12-26
 
 import ccxt
 import pandas as pd
@@ -69,21 +70,36 @@ class Trader:
         self.paper_trading = config.get('paper_trading', False)
         
         # --- NEW: Signal Mode (Normal vs Reverse) ---
-        # Default is 'normal'. Use 'reverse' to profit from "Perfect Loser" strategies.
         self.signal_mode = config.get('signal_mode', 'normal').lower()
+
+        # --- NEW: Trade Side (LONG, SHORT, or BOTH) ---
+        self.trade_side = config.get('trade_side', 'BOTH').upper()
+        if self.trade_side not in ['LONG', 'SHORT', 'BOTH']:
+             self.logger.warning(f"Invalid trade_side '{self.trade_side}'. Defaulting to 'BOTH'.")
+             self.trade_side = 'BOTH'
 
         # --- Check for multi-timeframe requirement ---
         self.high_timeframe = config.get('high_timeframe')
         self.high_tf_df = None # Will hold the high-timeframe data
 
         sanitized_symbol = re.sub(r'[^a-zA-Z0-9]', '', self.symbol)
+        
+        # Construct Base Trader ID
         self.trader_id = f"{self.exchange_id}_{config['strategy_name']}_{sanitized_symbol}_{self.timeframe}"
+        
+        # Append Side to ID if specific (Ensure unique ID for Long vs Short instances)
+        if self.trade_side != 'BOTH':
+            self.trader_id += f"_{self.trade_side}"
+
         if self.paper_trading: self.trader_id += "_PAPER"
         
         self.logger.info(f"Initializing trader with ID: {self.trader_id}")
         
         if self.signal_mode == 'reverse':
              self.logger.info("!!! REVERSE MODE ACTIVE: ALL SIGNALS WILL BE INVERTED !!!")
+        
+        if self.trade_side != 'BOTH':
+             self.logger.info(f"!!! TRADE SIDE RESTRICTION ACTIVE: ONLY {self.trade_side} POSITIONS WILL BE TAKEN !!!")
         
         if self.paper_trading:
             self.logger.info("!!! RUNNING IN PAPER TRADING MODE - NO REAL ORDERS WILL BE EXECUTED !!!")
@@ -366,7 +382,7 @@ class Trader:
         
         signal = self.strategy.get_entry_signal(prev_row, current_row)
 
-        # --- NEW: Reverse Signal Logic ---
+        # --- Reverse Signal Logic ---
         # If signal_mode is 'reverse', we flip the signal BEFORE proceeding.
         if signal and self.signal_mode == 'reverse':
             original_signal = signal
@@ -375,7 +391,13 @@ class Trader:
             self.logger.info(f"Reverse Mode: Inverted {original_signal} signal to {signal}.")
         
         if signal:
-            # --- NEW: Pyramiding Checks ---
+            # --- NEW: Trade Side Filter ---
+            # If a specific side is enforced (LONG or SHORT), ignore signals that don't match.
+            if self.trade_side != 'BOTH' and signal != self.trade_side:
+                self.logger.info(f"Ignored {signal} signal because trade_side is set to {self.trade_side}.")
+                return
+
+            # --- Pyramiding Checks ---
             if self.in_position:
                 # 1. Direction Check: Only add if signal matches current position
                 if signal != self.position_type:
@@ -445,7 +467,7 @@ class Trader:
                 
                 # --- CRITICAL: Update SL/TP for the WHOLE position ---
                 # We recalculate SL/TP based on the NEW Average Entry Price and CURRENT volatility.
-                # Note: 'signal' here is already reversed if needed, so SL/TP will be calculated correctly for the new direction.
+                # Note: 'signal' here is already reversed/filtered if needed, so SL/TP will be calculated correctly.
                 self.stop_loss_price, self.take_profit_price = self.strategy.calculate_exit_prices(
                     entry_price=self.entry_price, 
                     signal=signal, 
@@ -561,7 +583,15 @@ if __name__ == '__main__':
             
             exchange_id = config.get('exchange', 'unknown').lower()
             sanitized_symbol = re.sub(r'[^a-zA-Z0-9]', '', config.get('symbol', ''))
+            
+            # --- UPDATED: ID GENERATION WITH SIDE ---
             trader_id = f"{exchange_id}_{config.get('strategy_name', 'UnknownStrategy')}_{sanitized_symbol}_{config.get('timeframe', '')}"
+            
+            trade_side = config.get('trade_side', 'BOTH').upper()
+            if trade_side in ['LONG', 'SHORT']:
+                trader_id += f"_{trade_side}"
+            # ----------------------------------------
+            
             if args.paper_trading: trader_id += "_PAPER"
             
             logger = setup_logging(trader_id, args.paper_trading)

@@ -1,0 +1,64 @@
+//@version=5
+indicator("MTF Trend EMA + Export Data", overlay=true)
+
+// --- Inputs ---
+group_ema = "EMA Settings"
+len1 = input.int(50, title="Fast EMA Length", group=group_ema)
+len2 = input.int(100, title="Medium EMA Length", group=group_ema)
+len3 = input.int(200, title="Slow EMA Length", group=group_ema)
+
+group_tf = "Timeframe Settings"
+htf = input.timeframe("60", title="Background Timeframe (HTF)", group=group_tf)
+ltf = input.timeframe("1", title="Dots Timeframe (LTF)", group=group_tf)
+
+// --- Helper Function for Trend State ---
+// Returns: 1 (Bullish), -1 (Bearish), 0 (Sideways)
+getTrendState(l1, l2, l3) =>
+    e1 = ta.ema(close, l1)
+    e2 = ta.ema(close, l2)
+    e3 = ta.ema(close, l3)
+    bull = (e1 > e2) and (e2 > e3)
+    bear = (e1 < e2) and (e2 < e3)
+    bull ? 1 : bear ? -1 : 0
+
+// --- 1. Current Chart Logic ---
+ema50_current  = ta.ema(close, len1)
+currentState = getTrendState(len1, len2, len3)
+lineColor = currentState == 1 ? color.green : currentState == -1 ? color.red : color.yellow
+
+// --- 2. Higher Timeframe Logic (HTF) ---
+htf_state = request.security(syminfo.tickerid, htf, getTrendState(len1, len2, len3))
+bgColor = htf_state == 1  ? color.new(color.green, 90) : 
+          htf_state == -1 ? color.new(color.red, 90) : 
+          color.new(color.yellow, 90)
+
+// --- 3. Lower Timeframe Logic (LTF) ---
+ltf_state = request.security(syminfo.tickerid, ltf, getTrendState(len1, len2, len3))
+
+// Detect Changes for the Dots (Visuals only)
+ltf_became_bullish = (ltf_state == 1) and (ltf_state[1] != 1)
+ltf_became_bearish = (ltf_state == -1) and (ltf_state[1] != -1)
+ltf_became_sideways = (ltf_state == 0) and (ltf_state[1] != 0)
+
+
+// --- PLOTTING VISUALS (Chart Only) ---
+// 1. Background
+bgcolor(bgColor, title="HTF Background")
+
+// 2. Main Line
+plot(ema50_current, title="50 EMA Visual", color=lineColor, linewidth=3)
+
+// 3. Dots
+plot(ltf_became_bullish ? ema50_current : na, style=plot.style_circles, color=color.green, linewidth=5, title="LTF Bullish Dot")
+plot(ltf_became_bearish ? ema50_current : na, style=plot.style_circles, color=color.red, linewidth=5, title="LTF Bearish Dot")
+plot(ltf_became_sideways ? ema50_current : na, style=plot.style_circles, color=color.yellow, linewidth=5, title="LTF Sideways Dot")
+
+
+// --- PLOTTING DATA (For Export Only) ---
+// These plots use 'display.data_window' so they are invisible on the chart
+// but will appear in your CSV Export as columns.
+// Key: 1 = UP, -1 = DOWN, 0 = SIDEWAYS
+
+plot(htf_state,    title="HTF Trend Data",     display=display.data_window)
+plot(currentState, title="Current Trend Data", display=display.data_window)
+plot(ltf_state,    title="LTF Trend Data",     display=display.data_window)

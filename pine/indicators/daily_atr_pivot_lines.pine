@@ -1,0 +1,43 @@
+//@version=5
+indicator("Daily ATR Pivot Lines", overlay=true)
+
+// --- Input Settings ---
+atrLength = input.int(14, title="ATR Length", minval=1)
+lineColorUp = input.color(color.green, title="Upside Lines Color")
+lineColorDown = input.color(color.red, title="Downside Lines Color")
+
+// --- Calculations ---
+// Calculate Daily ATR and EMA
+// We use request.security to ensure we are getting Daily data regardless of chart timeframe
+dailyHigh  = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+dailyLow   = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+dailyClose = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+dailyTR    = request.security(syminfo.tickerid, "D", ta.tr, lookahead=barmerge.lookahead_on)
+
+// Calculate Daily ATR manually to ensure consistency with the requested length
+// Note: Simple RMA is standard for ATR, but some prefer SMA. Using ta.rma matches built-in ATR.
+dailyATR = request.security(syminfo.tickerid, "D", ta.atr(atrLength), lookahead=barmerge.lookahead_on)
+
+// Calculate Daily EMA with the same length as ATR (as requested)
+dailyEMA = request.security(syminfo.tickerid, "D", ta.ema(close, atrLength)[1], lookahead=barmerge.lookahead_on)
+
+// --- Pivot Baseline Logic ---
+// Upside Base: Highest of Previous Day Close and EMA
+baseHigh = math.max(dailyClose, dailyEMA)
+
+// Downside Base: Lowest of Previous Day Close and EMA
+baseLow = math.min(dailyClose, dailyEMA)
+
+// --- Plotting Upside Lines ---
+plot(baseHigh + (dailyATR * 0.25), "Up 25%", color=lineColorUp, linewidth=1)
+plot(baseHigh + (dailyATR * 0.50), "Up 50%", color=lineColorUp, linewidth=1, style=plot.style_circles)
+plot(baseHigh + (dailyATR * 0.75), "Up 75%", color=lineColorUp, linewidth=1)
+plot(baseHigh + (dailyATR * 1.00), "Up 100%", color=lineColorUp, linewidth=2)
+plot(baseHigh + (dailyATR * 1.25), "Up 125%", color=lineColorUp, linewidth=1)
+
+// --- Plotting Downside Lines ---
+plot(baseLow - (dailyATR * 0.25), "Down 25%", color=lineColorDown, linewidth=1)
+plot(baseLow - (dailyATR * 0.50), "Down 50%", color=lineColorDown, linewidth=1, style=plot.style_circles)
+plot(baseLow - (dailyATR * 0.75), "Down 75%", color=lineColorDown, linewidth=1)
+plot(baseLow - (dailyATR * 1.00), "Down 100%", color=lineColorDown, linewidth=2)
+plot(baseLow - (dailyATR * 1.25), "Down 125%", color=lineColorDown, linewidth=1)

@@ -1,0 +1,67 @@
+//@version=5
+indicator("ATR Trailing Stop [Skender Port]", shorttitle="ATR Stop", overlay=true)
+
+// --- Inputs ---
+lookbackPeriod = input.int(14, "ATR Period", minval=1)
+multiplier = input.float(3.0, "Multiplier", step=0.1)
+src = input.source(close, "Price Source")
+showLabels = input.bool(true, "Show Buy/Sell Labels")
+
+// --- ATR Calculation ---
+// The default Skender library uses RMA (Wilder's Smoothing) for ATR
+atr = ta.atr(lookbackPeriod)
+
+// --- Logic ---
+// We use 'var' variables to maintain state across bars
+var int trend = 0       // 1 = Bullish, -1 = Bearish
+var float stop = na
+
+// Calculate theoretical bands for the current bar
+upperBand = src + (atr * multiplier)
+lowerBand = src - (atr * multiplier)
+
+// Initialization (First bar or after warmup)
+if bar_index == lookbackPeriod
+    // Initial guess based on price movement
+    if src >= src[1]
+        trend := 1
+        stop := lowerBand
+    else
+        trend := -1
+        stop := upperBand
+
+// Main Trend Loop
+else if bar_index > lookbackPeriod
+    if trend == 1 // Currently Bullish
+        // Ratchet: Stop can only go UP, never down (unless trend changes)
+        stop := math.max(stop, lowerBand)
+        
+        // Check for trend Reversal (Price crosses below Stop)
+        if src < stop
+            trend := -1
+            stop := upperBand // Switch active stop to the ceiling
+            
+    else // Currently Bearish
+        // Ratchet: Stop can only go DOWN, never up (unless trend changes)
+        stop := math.min(stop, upperBand)
+        
+        // Check for trend Reversal (Price crosses above Stop)
+        if src > stop
+            trend := 1
+            stop := lowerBand // Switch active stop to the floor
+
+// --- Plotting ---
+// Color the line Green for Bullish, Red for Bearish
+plotColor = trend == 1 ? color.green : color.red
+plot(stop, "ATR Stop", color=plotColor, linewidth=2)
+
+// --- Signals ---
+// Detect when the trend variable changes from -1 to 1 (Buy) or 1 to -1 (Sell)
+buySignal = trend == 1 and trend[1] == -1
+sellSignal = trend == -1 and trend[1] == 1
+
+plotshape(showLabels and buySignal, "Buy", shape.labelup, location.belowbar, color.green, text="BUY", textcolor=color.white)
+plotshape(showLabels and sellSignal, "Sell", shape.labeldown, location.abovebar, color.red, text="SELL", textcolor=color.white)
+
+// Background color helper (optional)
+// bgcolor(trend == 1 ? color.new(color.green, 95) : color.new(color.red, 95))
